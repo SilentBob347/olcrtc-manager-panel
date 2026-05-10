@@ -1,0 +1,1190 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"embed"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io/fs"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+//go:embed web/dist/*
+var adminAssets embed.FS
+
+type Config struct {
+	Version          int        `json:"version"`
+	LegacyVersion    int        `json:"vesion"`
+	Name             string     `json:"name"`
+	Port             int        `json:"port"`
+	ActiveLocationID string     `json:"active_location_id"`
+	Clients          []Client   `json:"clients"`
+	Locations        []Location `json:"locations"`
+}
+
+func (c *Config) UnmarshalJSON(data []byte) error {
+	type config Config
+	var parsed config
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	*c = Config(parsed)
+	c.Normalize()
+	return nil
+}
+
+type Client struct {
+	ClientID  string     `json:"client-id"`
+	Locations []Location `json:"locations"`
+}
+
+type Location struct {
+	Name      string    `json:"name"`
+	ClientID  string    `json:"client-id"`
+	Endpoint  Endpoint  `json:"endpoint"`
+	Carrier   string    `json:"carrier"`
+	Transport Transport `json:"transport"`
+	Link      string    `json:"link"`
+	Data      string    `json:"data"`
+	DNS       string    `json:"dns"`
+}
+
+type Endpoint struct {
+	RoomID string `json:"room_id"`
+	Key    string `json:"key"`
+}
+
+type Transport struct {
+	Type    string
+	Payload map[string]string
+}
+
+func (t *Transport) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	var typ string
+	if err := json.Unmarshal(raw["type"], &typ); err != nil {
+		return fmt.Errorf("transport.type: %w", err)
+	}
+
+	payload := make(map[string]string)
+	for key, value := range raw {
+		if key == "type" {
+			continue
+		}
+
+		if key == "payload" {
+			var nested map[string]any
+			if err := json.Unmarshal(value, &nested); err != nil {
+				return fmt.Errorf("transport.payload: %w", err)
+			}
+			for payloadKey, payloadValue := range nested {
+				payload[payloadKey] = fmt.Sprint(payloadValue)
+			}
+			continue
+		}
+
+		var scalar any
+		if err := json.Unmarshal(value, &scalar); err != nil {
+			return fmt.Errorf("transport.%s: %w", key, err)
+		}
+		payload[key] = fmt.Sprint(scalar)
+	}
+
+	t.Type = typ
+	t.Payload = payload
+	return nil
+}
+
+func (t Transport) MarshalJSON() ([]byte, error) {
+	raw := map[string]any{"type": t.Type}
+	if len(t.Payload) != 0 {
+		raw["payload"] = t.Payload
+	}
+	return json.Marshal(raw)
+}
+
+type process struct {
+	location Location
+	cmd      *exec.Cmd
+}
+
+type starter func(context.Context, string, Location) (process, error)
+
+type Supervisor struct {
+	mu         sync.RWMutex
+	cfg        Config
+	olcrtcPath string
+	processes  map[string]process
+	start      starter
+}
+
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	var configPath string
+	var port int
+	var listenAddr string
+	flag.StringVar(&configPath, "config", "", "path to olcrtc-manager JSON config")
+	flag.IntVar(&port, "port", 0, "HTTP listen port; overrides config.port")
+	flag.StringVar(&listenAddr, "addr", envDefault("OLCRTC_MANAGER_ADDR", "127.0.0.1"), "HTTP listen address")
+	flag.Parse()
+
+	if configPath == "" {
+		return errors.New("-config is required")
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if port != 0 {
+		cfg.Port = port
+	}
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	olcrtcPath, err := resolveOlcrtcPath()
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	supervisor := NewSupervisor(olcrtcPath, startInstance)
+	if err := supervisor.StartAll(ctx, cfg); err != nil {
+		return err
+	}
+	defer supervisor.StopAll()
+
+	reloadc := make(chan os.Signal, 1)
+	signal.Notify(reloadc, syscall.SIGHUP)
+	defer signal.Stop(reloadc)
+
+	reload := func() error {
+		reloaded, err := loadConfig(configPath)
+		if err != nil {
+			return err
+		}
+		if port != 0 {
+			reloaded.Port = port
+		}
+		if reloaded.Port != cfg.Port {
+			return fmt.Errorf("reload cannot change port from %d to %d", cfg.Port, reloaded.Port)
+		}
+		if err := reloaded.Validate(); err != nil {
+			return err
+		}
+		return supervisor.Reload(ctx, reloaded)
+	}
+
+	handler := http.NewServeMux()
+	handler.HandleFunc("/-/reload", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !isLoopbackRequest(r) {
+			http.Error(w, "reload is only allowed from loopback", http.StatusForbidden)
+			return
+		}
+		if err := reload(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	adminFileServer, err := adminFileServer()
+	if err != nil {
+		return err
+	}
+	handler.Handle("/admin", adminAuth(http.HandlerFunc(adminPageHandler(adminFileServer))))
+	handler.Handle("/assets/", adminAuth(adminFileServer))
+	handler.Handle("/api/reload", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := reload(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})))
+	handler.Handle("/api/state", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, supervisor.State())
+	})))
+	handler.Handle("/api/clients", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		clientID, err := addClientFromRequest(r.Context(), configPath, olcrtcPath, r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := reload(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, map[string]string{"client_id": clientID})
+	})))
+	handler.Handle("/api/clients/", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete && r.Method != http.MethodPut {
+			w.Header().Set("Allow", "DELETE, PUT")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		clientID := strings.TrimPrefix(r.URL.Path, "/api/clients/")
+		if clientID == "" || strings.Contains(clientID, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodDelete:
+			if err := deleteClient(configPath, clientID); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := reload(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case http.MethodPut:
+			if err := updateClientFromRequest(r.Context(), configPath, olcrtcPath, clientID, r); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := reload(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})))
+	handler.Handle("/", subscriptionHandler(supervisor))
+
+	server := &http.Server{
+		Addr:              net.JoinHostPort(listenAddr, strconv.Itoa(cfg.Port)),
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	errc := make(chan error, 1)
+	go func() {
+		log.Printf("serving subscription and admin panel on %s", server.Addr)
+		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			errc <- err
+			return
+		}
+		errc <- nil
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return server.Shutdown(shutdownCtx)
+		case <-reloadc:
+			if err := reload(); err != nil {
+				log.Printf("reload failed: %v", err)
+				continue
+			}
+			log.Printf("reload completed")
+		case err := <-errc:
+			return err
+		}
+	}
+}
+
+func NewSupervisor(olcrtcPath string, start starter) *Supervisor {
+	return &Supervisor{
+		olcrtcPath: olcrtcPath,
+		processes:  make(map[string]process),
+		start:      start,
+	}
+}
+
+func (s *Supervisor) StartAll(ctx context.Context, cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, loc := range cfg.Locations {
+		p, err := s.start(ctx, s.olcrtcPath, loc)
+		if err != nil {
+			stopProcessMap(s.processes)
+			s.processes = make(map[string]process)
+			return err
+		}
+		s.processes[locationKey(loc)] = p
+	}
+	s.cfg = cfg
+	return nil
+}
+
+func (s *Supervisor) Reload(ctx context.Context, cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	next := locationsByKey(cfg.Locations)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current := locationsByKey(s.cfg.Locations)
+	started := make(map[string]process)
+
+	for id, nextLoc := range next {
+		currentLoc, exists := current[id]
+		if exists && reflect.DeepEqual(currentLoc, nextLoc) {
+			continue
+		}
+
+		p, err := s.start(ctx, s.olcrtcPath, nextLoc)
+		if err != nil {
+			stopProcessMap(started)
+			return err
+		}
+		started[id] = p
+	}
+
+	for id, currentLoc := range current {
+		nextLoc, exists := next[id]
+		if !exists || !reflect.DeepEqual(currentLoc, nextLoc) {
+			s.stopLocked(id)
+		}
+	}
+
+	for id, p := range started {
+		s.processes[id] = p
+	}
+	s.cfg = cfg
+	return nil
+}
+
+func (s *Supervisor) StopAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stopProcessMap(s.processes)
+	s.processes = make(map[string]process)
+}
+
+func (s *Supervisor) Subscription(now time.Time) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return subscription(s.cfg, now)
+}
+
+func (s *Supervisor) SubscriptionForClient(clientID string, now time.Time) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return subscriptionForClient(s.cfg, clientID, now)
+}
+
+func (s *Supervisor) State() State {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	clients := make(map[string][]LocationState)
+	for _, loc := range s.cfg.Locations {
+		key := locationKey(loc)
+		_, running := s.processes[key]
+		clients[loc.ClientID] = append(clients[loc.ClientID], LocationState{
+			Name:      loc.Name,
+			RoomID:    loc.Endpoint.RoomID,
+			URI:       locationURI(loc),
+			Carrier:   loc.Carrier,
+			Transport: loc.Transport.Type,
+			Link:      loc.Link,
+			DNS:       loc.DNS,
+			Running:   running,
+		})
+	}
+
+	clientIDs := make([]string, 0, len(clients))
+	for id := range clients {
+		clientIDs = append(clientIDs, id)
+		sort.Slice(clients[id], func(i, j int) bool {
+			return clients[id][i].Name < clients[id][j].Name
+		})
+	}
+	sort.Strings(clientIDs)
+
+	out := State{
+		Name:         s.cfg.Name,
+		Port:         s.cfg.Port,
+		ClientCount:  len(clientIDs),
+		RunningCount: len(s.processes),
+		Clients:      make([]ClientState, 0, len(clientIDs)),
+	}
+	for _, id := range clientIDs {
+		out.Clients = append(out.Clients, ClientState{
+			ClientID:  id,
+			Locations: clients[id],
+		})
+	}
+	return out
+}
+
+type State struct {
+	Name         string        `json:"name"`
+	Port         int           `json:"port"`
+	ClientCount  int           `json:"client_count"`
+	RunningCount int           `json:"running_count"`
+	Clients      []ClientState `json:"clients"`
+}
+
+type ClientState struct {
+	ClientID  string          `json:"client_id"`
+	Locations []LocationState `json:"locations"`
+}
+
+type LocationState struct {
+	Name      string `json:"name"`
+	RoomID    string `json:"room_id"`
+	URI       string `json:"uri"`
+	Carrier   string `json:"carrier"`
+	Transport string `json:"transport"`
+	Link      string `json:"link"`
+	DNS       string `json:"dns"`
+	Running   bool   `json:"running"`
+}
+
+type addClientRequest struct {
+	ClientID   string `json:"client_id"`
+	FromClient string `json:"from_client"`
+	Carrier    string `json:"carrier"`
+	Transport  string `json:"transport"`
+	DNS        string `json:"dns"`
+	Name       string `json:"name"`
+}
+
+type updateClientRequest struct {
+	Carrier   string `json:"carrier"`
+	Transport string `json:"transport"`
+	DNS       string `json:"dns"`
+	Name      string `json:"name"`
+}
+
+func addClientFromRequest(ctx context.Context, configPath, olcrtcPath string, r *http.Request) (string, error) {
+	var req addClientRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return "", fmt.Errorf("parse request: %w", err)
+	}
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	req.FromClient = strings.TrimSpace(req.FromClient)
+	req.Carrier = strings.TrimSpace(req.Carrier)
+	req.Transport = strings.TrimSpace(req.Transport)
+	req.DNS = strings.TrimSpace(req.DNS)
+	req.Name = strings.TrimSpace(req.Name)
+	if req.ClientID == "" {
+		return "", errors.New("client_id is required")
+	}
+	if strings.Contains(req.ClientID, "/") {
+		return "", errors.New("client_id must not contain slash")
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return "", err
+	}
+	cfg.ensureClientsFormat()
+	for _, client := range cfg.Clients {
+		if client.ClientID == req.ClientID {
+			return "", fmt.Errorf("client %q already exists", req.ClientID)
+		}
+	}
+
+	template, err := createLocationsFromRequest(cfg, req)
+	if err != nil {
+		return "", err
+	}
+
+	locations := make([]Location, 0, len(template))
+	for _, loc := range template {
+		loc.ClientID = req.ClientID
+		loc.Endpoint.Key, err = randomHex(32)
+		if err != nil {
+			return "", err
+		}
+		loc.Endpoint.RoomID, err = generateRoomID(ctx, olcrtcPath, loc.Carrier, loc.DNS)
+		if err != nil {
+			return "", err
+		}
+		locations = append(locations, loc)
+	}
+
+	cfg.Clients = append(cfg.Clients, Client{ClientID: req.ClientID, Locations: locations})
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return "", err
+	}
+	if err := saveConfig(configPath, cfg); err != nil {
+		return "", err
+	}
+	return req.ClientID, nil
+}
+
+func updateClientFromRequest(ctx context.Context, configPath, olcrtcPath, clientID string, r *http.Request) error {
+	var req updateClientRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return fmt.Errorf("parse request: %w", err)
+	}
+	req.Carrier = strings.TrimSpace(req.Carrier)
+	req.Transport = strings.TrimSpace(req.Transport)
+	req.DNS = strings.TrimSpace(req.DNS)
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Carrier == "" {
+		return errors.New("carrier is required")
+	}
+	if req.Transport == "" {
+		return errors.New("transport is required")
+	}
+	if req.DNS == "" {
+		return errors.New("dns is required")
+	}
+	if !isSupported(req.Carrier, req.Transport) {
+		return fmt.Errorf("unsupported carrier/transport combination %s + %s", req.Carrier, req.Transport)
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	cfg.ensureClientsFormat()
+
+	for i := range cfg.Clients {
+		if cfg.Clients[i].ClientID != clientID {
+			continue
+		}
+		if len(cfg.Clients[i].Locations) == 0 {
+			return fmt.Errorf("client %q has no locations", clientID)
+		}
+		loc := cfg.Clients[i].Locations[0]
+		if loc.Carrier != req.Carrier || loc.DNS != req.DNS {
+			loc.Endpoint.RoomID, err = generateRoomID(ctx, olcrtcPath, req.Carrier, req.DNS)
+			if err != nil {
+				return err
+			}
+		}
+		loc.Name = req.Name
+		if loc.Name == "" {
+			loc.Name = clientID
+		}
+		loc.ClientID = clientID
+		loc.Carrier = req.Carrier
+		loc.Transport = Transport{Type: req.Transport}
+		loc.DNS = req.DNS
+		loc.Link = defaultString(loc.Link, "direct")
+		loc.Data = defaultString(loc.Data, "data")
+		cfg.Clients[i].Locations[0] = loc
+
+		cfg.Normalize()
+		if err := cfg.Validate(); err != nil {
+			return err
+		}
+		return saveConfig(configPath, cfg)
+	}
+	return fmt.Errorf("client %q not found", clientID)
+}
+
+func createLocationsFromRequest(cfg Config, req addClientRequest) ([]Location, error) {
+	if req.Carrier != "" || req.Transport != "" || req.DNS != "" {
+		carrier := defaultString(req.Carrier, "wbstream")
+		transport := defaultString(req.Transport, "datachannel")
+		dns := defaultString(req.DNS, "1.1.1.1:53")
+		if !isSupported(carrier, transport) {
+			return nil, fmt.Errorf("unsupported carrier/transport combination %s + %s", carrier, transport)
+		}
+		name := req.Name
+		if name == "" {
+			name = req.ClientID
+		}
+		return []Location{{
+			Name:      name,
+			ClientID:  req.ClientID,
+			Carrier:   carrier,
+			Transport: Transport{Type: transport},
+			Link:      "direct",
+			Data:      "data",
+			DNS:       dns,
+		}}, nil
+	}
+	return templateLocations(cfg, req.FromClient)
+}
+
+func deleteClient(configPath, clientID string) error {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	cfg.ensureClientsFormat()
+
+	next := cfg.Clients[:0]
+	deleted := false
+	for _, client := range cfg.Clients {
+		if client.ClientID == clientID {
+			deleted = true
+			continue
+		}
+		next = append(next, client)
+	}
+	if !deleted {
+		return fmt.Errorf("client %q not found", clientID)
+	}
+	if len(next) == 0 {
+		return errors.New("cannot delete the last client")
+	}
+	cfg.Clients = next
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	return saveConfig(configPath, cfg)
+}
+
+func (c *Config) ensureClientsFormat() {
+	if len(c.Clients) != 0 {
+		for i := range c.Clients {
+			for j := range c.Clients[i].Locations {
+				if c.Clients[i].Locations[j].ClientID == "" {
+					c.Clients[i].Locations[j].ClientID = c.Clients[i].ClientID
+				}
+			}
+		}
+		return
+	}
+
+	byClient := make(map[string][]Location)
+	for _, loc := range c.Locations {
+		byClient[loc.ClientID] = append(byClient[loc.ClientID], loc)
+	}
+	clientIDs := make([]string, 0, len(byClient))
+	for id := range byClient {
+		clientIDs = append(clientIDs, id)
+	}
+	sort.Strings(clientIDs)
+	c.Clients = make([]Client, 0, len(clientIDs))
+	for _, id := range clientIDs {
+		c.Clients = append(c.Clients, Client{ClientID: id, Locations: byClient[id]})
+	}
+}
+
+func templateLocations(cfg Config, fromClient string) ([]Location, error) {
+	if fromClient == "" && len(cfg.Clients) > 0 {
+		fromClient = cfg.Clients[0].ClientID
+	}
+	for _, client := range cfg.Clients {
+		if client.ClientID != fromClient {
+			continue
+		}
+		if len(client.Locations) == 0 {
+			return nil, fmt.Errorf("client %q has no locations", fromClient)
+		}
+		locations := make([]Location, len(client.Locations))
+		copy(locations, client.Locations)
+		return locations, nil
+	}
+	return nil, fmt.Errorf("template client %q not found", fromClient)
+}
+
+func generateRoomID(ctx context.Context, olcrtcPath, carrier, dns string) (string, error) {
+	genCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(genCtx, olcrtcPath, "-mode", "gen", "-carrier", carrier, "-dns", dns, "-amount", "1").Output()
+	if err != nil {
+		return "", fmt.Errorf("generate room id: %w", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line, nil
+		}
+	}
+	return "", errors.New("olcrtc generated empty room id")
+}
+
+func randomHex(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate key: %w", err)
+	}
+	const hex = "0123456789abcdef"
+	out := make([]byte, len(buf)*2)
+	for i, b := range buf {
+		out[i*2] = hex[b>>4]
+		out[i*2+1] = hex[b&0x0f]
+	}
+	return string(out), nil
+}
+
+func saveConfig(path string, cfg Config) error {
+	cfg.Normalize()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
+}
+
+func (s *Supervisor) stopLocked(id string) {
+	p, ok := s.processes[id]
+	if !ok {
+		return
+	}
+	stopProcess(p)
+	delete(s.processes, id)
+}
+
+func locationsByKey(locations []Location) map[string]Location {
+	byKey := make(map[string]Location, len(locations))
+	for _, loc := range locations {
+		byKey[locationKey(loc)] = loc
+	}
+	return byKey
+}
+
+func stopProcessMap(processes map[string]process) {
+	for _, p := range processes {
+		stopProcess(p)
+	}
+}
+
+func startInstance(ctx context.Context, olcrtcPath string, loc Location) (process, error) {
+	args := serverArgs(loc)
+	cmd := exec.CommandContext(ctx, olcrtcPath, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return process{}, fmt.Errorf("start olcrtc for %s: %w", locationKey(loc), err)
+	}
+
+	p := process{location: loc, cmd: cmd}
+	log.Printf("started olcrtc for %s: %s %s", locationKey(loc), olcrtcPath, strings.Join(redactArgs(args), " "))
+
+	go func() {
+		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+			log.Printf("olcrtc for %s exited: %v", locationKey(loc), err)
+		}
+	}()
+
+	return p, nil
+}
+
+func stopProcess(p process) {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	_ = p.cmd.Process.Signal(syscall.SIGTERM)
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func startInstances(ctx context.Context, olcrtcPath string, locations []Location) ([]process, error) {
+	processes := make([]process, 0, len(locations))
+	for _, loc := range locations {
+		p, err := startInstance(ctx, olcrtcPath, loc)
+		if err != nil {
+			stopInstances(processes)
+			return nil, err
+		}
+		processes = append(processes, p)
+	}
+	return processes, nil
+}
+
+func stopInstances(processes []process) {
+	for _, p := range processes {
+		stopProcess(p)
+	}
+}
+
+func loadConfig(path string) (Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read config: %w", err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, fmt.Errorf("parse config: %w", err)
+	}
+	cfg.Normalize()
+	return cfg, nil
+}
+
+func (c *Config) Normalize() {
+	if c.Version == 0 && c.LegacyVersion != 0 {
+		c.Version = c.LegacyVersion
+	}
+
+	if len(c.Clients) == 0 {
+		return
+	}
+
+	locations := make([]Location, 0)
+	for _, client := range c.Clients {
+		for _, loc := range client.Locations {
+			if loc.ClientID == "" {
+				loc.ClientID = client.ClientID
+			}
+			locations = append(locations, loc)
+		}
+	}
+	c.Locations = locations
+}
+
+func (c Config) Validate() error {
+	if c.Port <= 0 || c.Port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535, got %d", c.Port)
+	}
+	if len(c.Locations) == 0 {
+		return errors.New("locations must not be empty")
+	}
+
+	ids := make(map[string]struct{}, len(c.Locations))
+	for i, loc := range c.Locations {
+		prefix := fmt.Sprintf("locations[%d]", i)
+		if loc.ClientID == "" {
+			return fmt.Errorf("%s.client-id is required", prefix)
+		}
+		if loc.Endpoint.RoomID == "" || loc.Endpoint.RoomID == "any" {
+			return fmt.Errorf("%s.endpoint.room_id must be concrete", prefix)
+		}
+		if loc.Endpoint.Key == "" {
+			return fmt.Errorf("%s.endpoint.key is required", prefix)
+		}
+		if loc.Carrier == "" {
+			return fmt.Errorf("%s.carrier is required", prefix)
+		}
+		if loc.Transport.Type == "" {
+			return fmt.Errorf("%s.transport.type is required", prefix)
+		}
+		key := locationKey(loc)
+		if _, exists := ids[key]; exists {
+			return fmt.Errorf("%s location key %q is duplicated", prefix, key)
+		}
+		ids[key] = struct{}{}
+		if !isSupported(loc.Carrier, loc.Transport.Type) {
+			return fmt.Errorf("%s: unsupported carrier/transport combination %s + %s", prefix, loc.Carrier, loc.Transport.Type)
+		}
+		if err := validatePayload(loc.Transport); err != nil {
+			return fmt.Errorf("%s.transport: %w", prefix, err)
+		}
+		if loc.Link == "" {
+			return fmt.Errorf("%s.link is required", prefix)
+		}
+		if loc.Data == "" {
+			return fmt.Errorf("%s.data is required", prefix)
+		}
+		if loc.DNS == "" {
+			return fmt.Errorf("%s.dns is required", prefix)
+		}
+	}
+	return nil
+}
+
+func locationKey(loc Location) string {
+	return strings.Join([]string{loc.ClientID, loc.Endpoint.RoomID, loc.Transport.Type}, ":")
+}
+
+func isSupported(carrier, transport string) bool {
+	matrix := map[string]map[string]bool{
+		"telemost": {
+			"datachannel":  false,
+			"vp8channel":   true,
+			"seichannel":   false,
+			"videochannel": true,
+		},
+		"jazz": {
+			"datachannel":  true,
+			"vp8channel":   true,
+			"seichannel":   true,
+			"videochannel": true,
+		},
+		"wbstream": {
+			"datachannel":  true,
+			"vp8channel":   true,
+			"seichannel":   true,
+			"videochannel": true,
+		},
+	}
+	return matrix[carrier][transport]
+}
+
+func validatePayload(t Transport) error {
+	allowed := map[string]map[string]struct{}{
+		"datachannel":  {},
+		"vp8channel":   {"vp8-fps": {}, "vp8-batch": {}},
+		"seichannel":   {"fps": {}, "batch": {}, "frag": {}, "ack-ms": {}},
+		"videochannel": {"video-w": {}, "video-h": {}, "video-fps": {}, "video-bitrate": {}, "video-hw": {}, "video-codec": {}, "video-qr-size": {}, "video-qr-recovery": {}, "video-tile-module": {}, "video-tile-rs": {}},
+	}
+
+	keys, ok := allowed[t.Type]
+	if !ok {
+		return fmt.Errorf("unknown transport %q", t.Type)
+	}
+	for key := range t.Payload {
+		if _, ok := keys[key]; !ok {
+			return fmt.Errorf("unsupported payload key %q for %s", key, t.Type)
+		}
+	}
+	return nil
+}
+
+func resolveOlcrtcPath() (string, error) {
+	if path := os.Getenv("OLCRTC_PATH"); path != "" {
+		return path, nil
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve executable path: %w", err)
+	}
+	return filepath.Join(filepath.Dir(exe), "olcrtc"), nil
+}
+
+func envDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func defaultString(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
+func serverArgs(loc Location) []string {
+	args := []string{
+		"-mode", "srv",
+		"-carrier", loc.Carrier,
+		"-transport", loc.Transport.Type,
+		"-id", loc.Endpoint.RoomID,
+		"-client-id", loc.ClientID,
+		"-key", loc.Endpoint.Key,
+		"-link", loc.Link,
+		"-data", loc.Data,
+		"-dns", loc.DNS,
+	}
+
+	for _, key := range sortedKeys(loc.Transport.Payload) {
+		args = append(args, "-"+key, loc.Transport.Payload[key])
+	}
+	return args
+}
+
+func redactArgs(args []string) []string {
+	out := append([]string(nil), args...)
+	for i := 0; i < len(out)-1; i++ {
+		if out[i] == "-key" {
+			out[i+1] = "<redacted>"
+			i++
+		}
+	}
+	return out
+}
+
+func subscriptionHandler(supervisor *Supervisor) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientID, ok := clientIDFromPath(r.URL.Path)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		sub, ok := supervisor.SubscriptionForClient(clientID, time.Now())
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte(sub))
+	})
+}
+
+func adminAuth(next http.Handler) http.Handler {
+	user := os.Getenv("OLCRTC_MANAGER_USER")
+	pass := os.Getenv("OLCRTC_MANAGER_PASS")
+	if user == "" || pass == "" {
+		return next
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPass, ok := r.BasicAuth()
+		userOK := subtle.ConstantTimeCompare([]byte(gotUser), []byte(user)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(gotPass), []byte(pass)) == 1
+		if !ok || !userOK || !passOK {
+			w.Header().Set("WWW-Authenticate", `Basic realm="olcrtc-manager"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func adminFileServer() (http.Handler, error) {
+	dist, err := fs.Sub(adminAssets, "web/dist")
+	if err != nil {
+		return nil, fmt.Errorf("load admin assets: %w", err)
+	}
+	return http.FileServer(http.FS(dist)), nil
+}
+
+func adminPageHandler(files http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		r.URL.Path = "/"
+		files.ServeHTTP(w, r)
+	}
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
+}
+
+func clientIDFromPath(path string) (string, bool) {
+	clientID := strings.TrimPrefix(path, "/")
+	if clientID == "" || strings.Contains(clientID, "/") {
+		return "", false
+	}
+	return clientID, true
+}
+
+func subscription(cfg Config, now time.Time) string {
+	return subscriptionForLocations(cfg.Name, cfg.Locations, now)
+}
+
+func subscriptionForClient(cfg Config, clientID string, now time.Time) (string, bool) {
+	locations := make([]Location, 0)
+	for _, loc := range cfg.Locations {
+		if loc.ClientID == clientID {
+			locations = append(locations, loc)
+		}
+	}
+	if len(locations) == 0 {
+		return "", false
+	}
+	return subscriptionForLocations(cfg.Name, locations, now), true
+}
+
+func subscriptionForLocations(name string, locations []Location, now time.Time) string {
+	var b bytes.Buffer
+	if name != "" {
+		fmt.Fprintf(&b, "#name: %s\n", name)
+	}
+	fmt.Fprintf(&b, "#update: %d\n\n", now.Unix())
+
+	for _, loc := range locations {
+		fmt.Fprintln(&b, locationURI(loc))
+		if loc.Name != "" {
+			fmt.Fprintf(&b, "##name: %s\n", loc.Name)
+		}
+		fmt.Fprintln(&b)
+	}
+	return b.String()
+}
+
+func locationURI(loc Location) string {
+	payload := payloadString(loc.Transport.Payload)
+	return fmt.Sprintf("olcrtc://%s?%s%s@%s#%s%%%s$%s",
+		loc.Carrier,
+		loc.Transport.Type,
+		payload,
+		loc.Endpoint.RoomID,
+		loc.Endpoint.Key,
+		loc.ClientID,
+		loc.Name,
+	)
+}
+
+func payloadString(payload map[string]string) string {
+	if len(payload) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(payload))
+	for _, key := range sortedKeys(payload) {
+		parts = append(parts, key+"="+payload[key])
+	}
+	return "<" + strings.Join(parts, "&") + ">"
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "name": "OlcRTC VPS",
+  "port": 8888,
+  "clients": [
+    {
+      "client-id": "default",
+      "locations": [
+        {
+          "name": "my-vps",
+          "endpoint": {
+            "room_id": "replace-with-generated-room-id",
+            "key": "replace-with-64-hex-character-key"
+          },
+          "carrier": "wbstream",
+          "transport": {
+            "type": "datachannel"
+          },
+          "link": "direct",
+          "data": "data",
+          "dns": "1.1.1.1:53"
+        }
+      ]
+    }
+  ]
+}

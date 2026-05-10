@@ -1,0 +1,20 @@
+[Unit]
+Description=OlcRTC Manager Panel
+Documentation=https://github.com/openlibrecommunity/olcrtc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=olcrtc
+Group=olcrtc
+EnvironmentFile=/etc/olcrtc-manager/panel.env
+ExecStart=/usr/local/bin/olcrtc-manager -config /etc/olcrtc-manager/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
