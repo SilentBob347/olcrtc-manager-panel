@@ -50,6 +50,41 @@ If you only change Go code and `cmd/olcrtc-manager/web/dist` is already present,
 
 ## Install
 
+### One-command install
+
+Fresh install on a Debian/Ubuntu VPS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BigDaddy3334/olcrtc-manager-panel/main/scripts/install.sh | sudo bash
+```
+
+The installer:
+
+- installs required packages;
+- installs Go if the system Go is missing or too old;
+- builds and installs `olcrtc`;
+- builds and installs `olcrtc-manager`;
+- creates `/etc/olcrtc-manager/config.json` if it does not exist;
+- keeps existing config and `panel.env`;
+- installs and starts `olcrtc-manager.service`.
+
+By default the service listens on `127.0.0.1:8888`. To bind the panel directly to the VPS public interface:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BigDaddy3334/olcrtc-manager-panel/main/scripts/install.sh | sudo env PANEL_ADDR=0.0.0.0 bash
+```
+
+Fresh installs have no default password. Open `/admin` and create the admin password on first run. If you bind to `0.0.0.0`, do this immediately or put the panel behind nginx/firewall first.
+
+Installer options can be passed through environment variables:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BigDaddy3334/olcrtc-manager-panel/main/scripts/install.sh | \
+  sudo env PANEL_PORT=9443 CLIENT_ID=alice DNS_SERVER=1.1.1.1:53 bash
+```
+
+### Manual install
+
 Copy binaries and config:
 
 ```sh
