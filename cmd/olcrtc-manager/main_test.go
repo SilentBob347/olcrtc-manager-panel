@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -104,6 +106,43 @@ func TestSubscriptionForClientIncludesOnlyClientLocations(t *testing.T) {
 	}
 }
 
+func TestSubscriptionForClientIncludesQuotaMetadata(t *testing.T) {
+	loc := testLocation("room-01", "Netherlands")
+	cfg := Config{
+		Name: "ScumVPN",
+		Port: 8888,
+		Clients: []Client{
+			{
+				ClientID: "user",
+				Quota: Quota{
+					SpeedMbps: 50,
+					TrafficGB: 100,
+					UsedGB:    25,
+					ExpiresAt: "2026-06-01",
+				},
+				Locations: []Location{loc},
+			},
+		},
+		Locations: []Location{loc},
+	}
+
+	got, ok := subscriptionForClient(cfg, "user", time.Unix(1778011200, 0))
+	if !ok {
+		t.Fatal("subscriptionForClient returned ok=false")
+	}
+	for _, want := range []string{
+		"#quota-speed-mbps: 50",
+		"#quota-traffic-gb: 100",
+		"#quota-used-gb: 25",
+		"#quota-expires-at: 2026-06-01",
+		"#quota-status: active",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("subscription missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestSubscriptionForClientRejectsUnknownClient(t *testing.T) {
 	cfg := testConfig(testLocation("room-01", "Netherlands"))
 
@@ -113,15 +152,15 @@ func TestSubscriptionForClientRejectsUnknownClient(t *testing.T) {
 }
 
 func TestSubscriptionHandlerServesClientPath(t *testing.T) {
-	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (process, error) {
-		return process{location: loc}, nil
+	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
+		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
 	})
 	loc := testLocation("room-01", "Netherlands")
 	if err := supervisor.StartAll(context.Background(), testConfig(loc)); err != nil {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/user", nil)
+	req := httptest.NewRequest(http.MethodGet, "/user/", nil)
 	rec := httptest.NewRecorder()
 	subscriptionHandler(supervisor).ServeHTTP(rec, req)
 
@@ -134,8 +173,8 @@ func TestSubscriptionHandlerServesClientPath(t *testing.T) {
 }
 
 func TestSubscriptionHandlerRejectsRootAndUnknownClient(t *testing.T) {
-	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (process, error) {
-		return process{location: loc}, nil
+	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
+		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
 	})
 	if err := supervisor.StartAll(context.Background(), testConfig(testLocation("room-01", "Netherlands"))); err != nil {
 		t.Fatal(err)
@@ -148,6 +187,49 @@ func TestSubscriptionHandlerRejectsRootAndUnknownClient(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want %d", path, rec.Code, http.StatusNotFound)
 		}
+	}
+}
+
+func TestFirstRunSetupCreatesAdminSession(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	t.Setenv("OLCRTC_MANAGER_ENV_FILE", filepath.Join(dir, "panel.env"))
+	t.Setenv("OLCRTC_MANAGER_USER", "")
+	t.Setenv("OLCRTC_MANAGER_PASS", "")
+	adminSessions.Clear()
+
+	rec := httptest.NewRecorder()
+	authMeHandler(configPath).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/auth/me", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("auth me status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"setup_required": true`) {
+		t.Fatalf("auth me did not request setup: %s", rec.Body.String())
+	}
+
+	body := bytes.NewBufferString(`{"user":"admin","password":"firstpass123"}`)
+	rec = httptest.NewRecorder()
+	setupHandler(configPath).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/auth/setup", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("setup status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	for _, cookie := range rec.Result().Cookies() {
+		req.AddCookie(cookie)
+	}
+	rec = httptest.NewRecorder()
+	authMeHandler(configPath).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"authenticated": true`) {
+		t.Fatalf("auth me after setup status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("protected status without session = %d, want 401", rec.Code)
 	}
 }
 
@@ -266,9 +348,9 @@ func TestSupervisorReloadStartsAddedLocationAndUpdatesSubscription(t *testing.T)
 	loc1 := testLocation("room-01", "Netherlands")
 	loc2 := testLocation("room-02", "Germany")
 	started := make([]string, 0)
-	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (process, error) {
+	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
 		started = append(started, locationKey(loc))
-		return process{location: loc}, nil
+		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
 	})
 
 	if err := supervisor.StartAll(context.Background(), testConfig(loc1)); err != nil {
@@ -291,9 +373,9 @@ func TestSupervisorReloadRestartsChangedLocation(t *testing.T) {
 	changed := loc
 	changed.Endpoint.RoomID = "room-02"
 	started := make([]string, 0)
-	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (process, error) {
+	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
 		started = append(started, loc.Endpoint.RoomID)
-		return process{location: loc}, nil
+		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
 	})
 
 	if err := supervisor.StartAll(context.Background(), testConfig(loc)); err != nil {
@@ -315,11 +397,11 @@ func TestSupervisorReloadFailureKeepsCurrentConfig(t *testing.T) {
 	loc1 := testLocation("room-01", "Netherlands")
 	loc2 := testLocation("room-02", "Germany")
 	startErr := errors.New("boom")
-	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (process, error) {
+	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
 		if loc.Endpoint.RoomID == "room-02" {
-			return process{}, startErr
+			return nil, startErr
 		}
-		return process{location: loc}, nil
+		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
 	})
 
 	if err := supervisor.StartAll(context.Background(), testConfig(loc1)); err != nil {
