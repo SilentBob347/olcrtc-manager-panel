@@ -374,9 +374,18 @@ function ClientFormFields({
               className="inline-flex h-10 items-center rounded-md border border-primary bg-secondary px-3 text-xs font-medium text-primary hover:bg-primary/10"
               type="button"
               onClick={() => {
-                const bytes = new Uint8Array(12);
+                const ALPHABET =
+                  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+                const bytes = new Uint8Array(21);
                 crypto.getRandomValues(bytes);
-                set({ client_id: btoa(String.fromCharCode(...bytes)) });
+
+                let client_id = "";
+                for (let i = 0; i < bytes.length; i++) {
+                  client_id += ALPHABET[bytes[i] % 62];
+                }
+
+                set({ client_id });
               }}
             >
               Generate
