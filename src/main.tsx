@@ -363,12 +363,34 @@ function ClientFormFields({
       {includeClientID && (
         <label className="grid gap-2 text-sm text-muted-foreground">
           ID клиента
-          <input
-            className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
-            value={form.client_id}
-            onChange={(event) => set({ client_id: event.target.value })}
-            placeholder="client-id"
-          />
+          <div className="flex gap-2">
+            <input
+              className="h-10 flex-1 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
+              value={form.client_id}
+              onChange={(event) => set({ client_id: event.target.value })}
+              placeholder="client-id"
+            />
+            <button
+              className="inline-flex h-10 items-center rounded-md border border-primary bg-secondary px-3 text-xs font-medium text-primary hover:bg-primary/10"
+              type="button"
+              onClick={() => {
+                const ALPHABET =
+                  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+                const bytes = new Uint8Array(21);
+                crypto.getRandomValues(bytes);
+
+                let client_id = "";
+                for (let i = 0; i < bytes.length; i++) {
+                  client_id += ALPHABET[bytes[i] % 62];
+                }
+
+                set({ client_id });
+              }}
+            >
+              Generate
+            </button>
+          </div>
         </label>
       )}
       <div className="grid gap-3 rounded-md border border-border bg-background p-3">
