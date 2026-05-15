@@ -8,8 +8,6 @@ OLCRTC_REF="${OLCRTC_REF:-master}"
 GO_VERSION="${GO_VERSION:-1.25.0}"
 PANEL_ADDR="${PANEL_ADDR:-127.0.0.1}"
 PANEL_PORT="${PANEL_PORT:-8888}"
-DNS_SERVER="${DNS_SERVER:-1.1.1.1:53}"
-CLIENT_ID="${CLIENT_ID:-default}"
 INSTALL_SRC_DIR="${INSTALL_SRC_DIR:-/opt/olcrtc-manager-src}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/olcrtc-manager}"
 CONFIG_PATH="${CONFIG_PATH:-$CONFIG_DIR/config.json}"
@@ -106,40 +104,14 @@ write_config_if_missing() {
 		return
 	fi
 
-	log "generating initial room"
-	local room key
-	room="$(/usr/local/bin/olcrtc -mode gen -carrier wbstream -dns "$DNS_SERVER" -amount 1 | tail -n1 | tr -d '\r')"
-	[ -n "$room" ] || die "failed to generate initial room"
-	key="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+	log "creating initial config without rooms"
 
 	cat > "$CONFIG_PATH" <<EOF
 {
   "version": 1,
   "name": "OlcRTC VPS",
   "port": $PANEL_PORT,
-  "clients": [
-    {
-      "client-id": "$CLIENT_ID",
-      "quota": {},
-      "locations": [
-        {
-          "name": "$CLIENT_ID",
-          "client-id": "$CLIENT_ID",
-          "endpoint": {
-            "room_id": "$room",
-            "key": "$key"
-          },
-          "carrier": "wbstream",
-          "transport": {
-            "type": "datachannel"
-          },
-          "link": "direct",
-          "data": "data",
-          "dns": "$DNS_SERVER"
-        }
-      ]
-    }
-  ]
+  "clients": []
 }
 EOF
 	chmod 0600 "$CONFIG_PATH"
