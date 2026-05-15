@@ -64,7 +64,7 @@ The installer:
 - installs Go if the system Go is missing or too old;
 - builds and installs `olcrtc`;
 - builds and installs `olcrtc-manager`;
-- creates `/etc/olcrtc-manager/config.json` if it does not exist;
+- creates `/etc/olcrtc-manager/config.json` without initial rooms if it does not exist;
 - keeps existing config and `panel.env`;
 - installs and starts `olcrtc-manager.service`.
 
@@ -75,12 +75,13 @@ curl -fsSL https://raw.githubusercontent.com/BigDaddy3334/olcrtc-manager-panel/m
 ```
 
 Fresh installs have no default password. Open `/admin` and create the admin password on first run. If you bind to `0.0.0.0`, do this immediately or put the panel behind nginx/firewall first.
+Fresh installs also have no rooms; create clients and paste room IDs manually after logging in.
 
 Installer options can be passed through environment variables:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/BigDaddy3334/olcrtc-manager-panel/main/scripts/install.sh | \
-  sudo env PANEL_PORT=9443 CLIENT_ID=alice DNS_SERVER=1.1.1.1:53 bash
+  sudo env PANEL_PORT=9443 bash
 ```
 
 ### Manual install

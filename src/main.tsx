@@ -394,8 +394,6 @@ function ClientFormFields({
   includeClientID: boolean;
 }) {
   const set = (patch: Partial<ClientForm>) => setForm(normalizeForm({ ...form, ...patch }));
-  const [generateError, setGenerateError] = useState("");
-  const [generatingRoom, setGeneratingRoom] = useState<number | null>(null);
 
   const setLocation = (index: number, patch: Partial<ClientLocationForm>) => {
     const locations = form.locations.map((location, current) =>
@@ -409,25 +407,6 @@ function ClientFormFields({
   const removeLocation = (index: number) => {
     if (form.locations.length <= 1) return;
     set({ locations: form.locations.filter((_, current) => current !== index) });
-  };
-
-  const generateRoom = async (index: number) => {
-    const location = form.locations[index];
-    setGenerateError("");
-    setGeneratingRoom(index);
-    try {
-      const res = await request("/api/tools/generate-room", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ carrier: location.carrier, dns: location.dns.trim() }),
-      });
-      const body = (await res.json()) as { room_id: string };
-      setLocation(index, { room_id: body.room_id });
-    } catch (err) {
-      setGenerateError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setGeneratingRoom(null);
-    }
   };
 
   return (
@@ -570,22 +549,12 @@ function ClientFormFields({
             </div>
             <label className="grid gap-2 text-sm text-muted-foreground">
               Room ID
-              <div className="flex gap-2">
-                <input
-                  className="h-10 flex-1 rounded-md border border-border bg-card px-3 text-foreground outline-none focus:border-primary"
-                  value={location.room_id}
-                  onChange={(event) => setLocation(index, { room_id: event.target.value })}
-                  placeholder="room-id"
-                />
-                <button
-                  className="inline-flex h-10 items-center rounded-md border border-primary bg-secondary px-3 text-xs font-medium text-primary hover:bg-primary/10 disabled:opacity-60"
-                  type="button"
-                  disabled={generatingRoom === index}
-                  onClick={() => generateRoom(index)}
-                >
-                  Generate
-                </button>
-              </div>
+              <input
+                className="h-10 rounded-md border border-border bg-card px-3 text-foreground outline-none focus:border-primary"
+                value={location.room_id}
+                onChange={(event) => setLocation(index, { room_id: event.target.value })}
+                placeholder="room-id"
+              />
             </label>
             <label className="grid gap-2 text-sm text-muted-foreground">
               Key
@@ -642,7 +611,6 @@ function ClientFormFields({
           </div>
         );
       })}
-      {generateError && <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{generateError}</div>}
       <button
         className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80"
         type="button"

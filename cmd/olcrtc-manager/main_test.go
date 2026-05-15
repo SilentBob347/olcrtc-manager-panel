@@ -255,6 +255,18 @@ func TestConfigRejectsAnyRoomID(t *testing.T) {
 	}
 }
 
+func TestConfigAllowsFreshInstallWithoutLocations(t *testing.T) {
+	cfg := Config{
+		Name:    "OlcRTC VPS",
+		Port:    8888,
+		Clients: []Client{},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
 func TestTransportUnmarshalPayload(t *testing.T) {
 	var cfg Config
 	data := []byte(`{
