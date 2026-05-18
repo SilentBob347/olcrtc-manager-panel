@@ -119,18 +119,19 @@ type ClientForm = {
   locations: ClientLocationForm[];
 };
 
-const carriers = ["wbstream", "jazz", "telemost"];
+const carriers = ["jitsi", "wbstream", "telemost", "jazz"];
 const transportsByCarrier: Record<string, string[]> = {
-  wbstream: ["datachannel", "vp8channel", "seichannel", "videochannel"],
-  jazz: ["datachannel", "vp8channel", "seichannel", "videochannel"],
+  jitsi: ["datachannel", "vp8channel", "seichannel", "videochannel"],
+  wbstream: ["vp8channel", "seichannel", "videochannel", "datachannel"],
   telemost: ["vp8channel", "videochannel"],
+  jazz: ["datachannel"],
 };
 
 const defaultLocationForm: ClientLocationForm = {
   name: "",
   room_id: "",
   key: "",
-  carrier: "wbstream",
+  carrier: "jitsi",
   transport: "datachannel",
   payload: {},
   dns: "1.1.1.1:53",
@@ -161,6 +162,10 @@ const payloadFields: Record<string, Array<{ key: string; label: string; defaultV
     { key: "video-bitrate", label: "Bitrate", defaultValue: "5000k" },
     { key: "video-codec", label: "Codec", defaultValue: "qrcode" },
     { key: "video-hw", label: "Hardware accel", defaultValue: "none" },
+    { key: "video-qr-size", label: "QR size", defaultValue: "0" },
+    { key: "video-qr-recovery", label: "QR recovery", defaultValue: "low" },
+    { key: "video-tile-module", label: "Tile module", defaultValue: "4" },
+    { key: "video-tile-rs", label: "Tile RS", defaultValue: "20" },
   ],
 };
 
@@ -175,6 +180,10 @@ async function request(path: string, options?: RequestInit) {
 
 function transportOptions(carrier: string) {
   return transportsByCarrier[carrier] ?? transportsByCarrier.wbstream;
+}
+
+function roomPlaceholder(carrier: string) {
+  return carrier === "jitsi" ? "https://meet.example.org/room" : "room-id";
 }
 
 function normalizeLocationForm(location: ClientLocationForm): ClientLocationForm {
@@ -508,7 +517,7 @@ function LocationFormFields({
       </label>
       <div className="grid gap-3 md:grid-cols-2">
         <label className="grid gap-2 text-sm text-muted-foreground">
-          Carrier
+          Provider
           <select
             className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
             value={location.carrier}
@@ -542,7 +551,7 @@ function LocationFormFields({
           className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
           value={location.room_id}
           onChange={(event) => set({ room_id: event.target.value })}
-          placeholder="room-id"
+          placeholder={roomPlaceholder(location.carrier)}
         />
       </label>
       <label className="grid gap-2 text-sm text-muted-foreground">
@@ -736,7 +745,7 @@ function ClientFormFields({
             </label>
             <div className="grid gap-3 md:grid-cols-2">
               <label className="grid gap-2 text-sm text-muted-foreground">
-                Carrier
+                Provider
                 <select
                   className="h-10 rounded-md border border-border bg-card px-3 text-foreground outline-none focus:border-primary"
                   value={location.carrier}
@@ -770,7 +779,7 @@ function ClientFormFields({
                 className="h-10 rounded-md border border-border bg-card px-3 text-foreground outline-none focus:border-primary"
                 value={location.room_id}
                 onChange={(event) => setLocation(index, { room_id: event.target.value })}
-                placeholder="room-id"
+                placeholder={roomPlaceholder(location.carrier)}
               />
             </label>
             <label className="grid gap-2 text-sm text-muted-foreground">
@@ -1317,7 +1326,7 @@ function App() {
                             <tr className="border-b border-border text-left text-muted-foreground">
                               <th className="py-2 pr-3 font-medium">Локация</th>
                               <th className="py-2 pr-3 font-medium">Room</th>
-                              <th className="py-2 pr-3 font-medium">Carrier</th>
+                              <th className="py-2 pr-3 font-medium">Provider</th>
                               <th className="py-2 pr-3 font-medium">Transport</th>
                               <th className="py-2 pr-3 font-medium">DNS</th>
                               <th className="py-2 pr-3 font-medium">Статус</th>

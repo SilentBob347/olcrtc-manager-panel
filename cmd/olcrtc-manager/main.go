@@ -29,6 +29,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed web/dist/*
@@ -94,6 +96,73 @@ type Endpoint struct {
 type Transport struct {
 	Type    string
 	Payload map[string]string
+}
+
+type olcrtcRuntimeConfig struct {
+	Mode   string             `yaml:"mode"`
+	Auth   olcrtcAuthConfig   `yaml:"auth"`
+	Room   olcrtcRoomConfig   `yaml:"room,omitempty"`
+	Crypto olcrtcCryptoConfig `yaml:"crypto,omitempty"`
+	Net    olcrtcNetConfig    `yaml:"net"`
+	SOCKS  olcrtcSocksConfig  `yaml:"socks,omitempty"`
+	VP8    *olcrtcVP8Config   `yaml:"vp8,omitempty"`
+	SEI    *olcrtcSEIConfig   `yaml:"sei,omitempty"`
+	Video  *olcrtcVideoConfig `yaml:"video,omitempty"`
+	Gen    *olcrtcGenConfig   `yaml:"gen,omitempty"`
+	Data   string             `yaml:"data,omitempty"`
+	Debug  bool               `yaml:"debug,omitempty"`
+	FFmpeg string             `yaml:"ffmpeg,omitempty"`
+}
+
+type olcrtcAuthConfig struct {
+	Provider string `yaml:"provider"`
+}
+
+type olcrtcRoomConfig struct {
+	ID string `yaml:"id,omitempty"`
+}
+
+type olcrtcCryptoConfig struct {
+	Key string `yaml:"key,omitempty"`
+}
+
+type olcrtcNetConfig struct {
+	Transport string `yaml:"transport,omitempty"`
+	DNS       string `yaml:"dns,omitempty"`
+}
+
+type olcrtcSocksConfig struct {
+	ProxyAddr string `yaml:"proxy_addr,omitempty"`
+	ProxyPort int    `yaml:"proxy_port,omitempty"`
+}
+
+type olcrtcVP8Config struct {
+	FPS       int `yaml:"fps,omitempty"`
+	BatchSize int `yaml:"batch_size,omitempty"`
+}
+
+type olcrtcSEIConfig struct {
+	FPS          int `yaml:"fps,omitempty"`
+	BatchSize    int `yaml:"batch_size,omitempty"`
+	FragmentSize int `yaml:"fragment_size,omitempty"`
+	AckTimeoutMS int `yaml:"ack_timeout_ms,omitempty"`
+}
+
+type olcrtcVideoConfig struct {
+	Width      int    `yaml:"width,omitempty"`
+	Height     int    `yaml:"height,omitempty"`
+	FPS        int    `yaml:"fps,omitempty"`
+	Bitrate    string `yaml:"bitrate,omitempty"`
+	HW         string `yaml:"hw,omitempty"`
+	QRSize     int    `yaml:"qr_size,omitempty"`
+	QRRecovery string `yaml:"qr_recovery,omitempty"`
+	Codec      string `yaml:"codec,omitempty"`
+	TileModule int    `yaml:"tile_module,omitempty"`
+	TileRS     int    `yaml:"tile_rs,omitempty"`
+}
+
+type olcrtcGenConfig struct {
+	Amount int `yaml:"amount"`
 }
 
 func (t *Transport) UnmarshalJSON(data []byte) error {
@@ -1389,9 +1458,22 @@ func templateLocations(cfg Config, fromClient string) ([]Location, error) {
 func generateRoomID(ctx context.Context, olcrtcPath, carrier, dns string) (string, error) {
 	genCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(genCtx, olcrtcPath, "-mode", "gen", "-carrier", carrier, "-dns", dns, "-amount", "1").Output()
+
+	cfg := olcrtcRuntimeConfig{
+		Mode: "gen",
+		Auth: olcrtcAuthConfig{Provider: carrier},
+		Net:  olcrtcNetConfig{DNS: dns},
+		Gen:  &olcrtcGenConfig{Amount: 1},
+	}
+	configPath, err := writeTempOlcrtcConfig("olcrtc-manager-gen", cfg)
 	if err != nil {
-		return "", fmt.Errorf("generate room id: %w", err)
+		return "", err
+	}
+	defer func() { _ = os.Remove(configPath) }()
+
+	out, err := exec.CommandContext(genCtx, olcrtcPath, configPath).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("generate room id: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
@@ -1400,6 +1482,138 @@ func generateRoomID(ctx context.Context, olcrtcPath, carrier, dns string) (strin
 		}
 	}
 	return "", errors.New("olcrtc generated empty room id")
+}
+
+func serverConfig(loc Location) (olcrtcRuntimeConfig, error) {
+	cfg := olcrtcRuntimeConfig{
+		Mode:   "srv",
+		Auth:   olcrtcAuthConfig{Provider: loc.Carrier},
+		Room:   olcrtcRoomConfig{ID: loc.Endpoint.RoomID},
+		Crypto: olcrtcCryptoConfig{Key: loc.Endpoint.Key},
+		Net: olcrtcNetConfig{
+			Transport: loc.Transport.Type,
+			DNS:       loc.DNS,
+		},
+		Data: loc.Data,
+	}
+	if err := applyTransportPayload(&cfg, loc.Transport); err != nil {
+		return olcrtcRuntimeConfig{}, err
+	}
+	return cfg, nil
+}
+
+func applyTransportPayload(cfg *olcrtcRuntimeConfig, transport Transport) error {
+	payload := cleanPayload(transport.Payload)
+	switch transport.Type {
+	case "datachannel":
+		return nil
+	case "vp8channel":
+		vp8 := olcrtcVP8Config{}
+		if err := setPayloadInt(payload, "vp8-fps", &vp8.FPS); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "vp8-batch", &vp8.BatchSize); err != nil {
+			return err
+		}
+		if vp8 != (olcrtcVP8Config{}) {
+			cfg.VP8 = &vp8
+		}
+	case "seichannel":
+		sei := olcrtcSEIConfig{}
+		if err := setPayloadInt(payload, "fps", &sei.FPS); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "batch", &sei.BatchSize); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "frag", &sei.FragmentSize); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "ack-ms", &sei.AckTimeoutMS); err != nil {
+			return err
+		}
+		if sei != (olcrtcSEIConfig{}) {
+			cfg.SEI = &sei
+		}
+	case "videochannel":
+		video := olcrtcVideoConfig{}
+		if err := setPayloadInt(payload, "video-w", &video.Width); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "video-h", &video.Height); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "video-fps", &video.FPS); err != nil {
+			return err
+		}
+		if err := setPayloadNonNegativeInt(payload, "video-qr-size", &video.QRSize); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "video-tile-module", &video.TileModule); err != nil {
+			return err
+		}
+		if err := setPayloadNonNegativeInt(payload, "video-tile-rs", &video.TileRS); err != nil {
+			return err
+		}
+		video.Bitrate = payload["video-bitrate"]
+		video.HW = payload["video-hw"]
+		video.Codec = payload["video-codec"]
+		video.QRRecovery = payload["video-qr-recovery"]
+		if video != (olcrtcVideoConfig{}) {
+			cfg.Video = &video
+		}
+	default:
+		return fmt.Errorf("unknown transport %q", transport.Type)
+	}
+	return nil
+}
+
+func setPayloadInt(payload map[string]string, key string, dst *int) error {
+	value := strings.TrimSpace(payload[key])
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("%s must be a positive integer", key)
+	}
+	*dst = parsed
+	return nil
+}
+
+func setPayloadNonNegativeInt(payload map[string]string, key string, dst *int) error {
+	value := strings.TrimSpace(payload[key])
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	*dst = parsed
+	return nil
+}
+
+func writeTempOlcrtcConfig(prefix string, cfg olcrtcRuntimeConfig) (string, error) {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshal olcrtc config: %w", err)
+	}
+	file, err := os.CreateTemp("", prefix+"-*.yaml")
+	if err != nil {
+		return "", fmt.Errorf("create olcrtc config: %w", err)
+	}
+	path := file.Name()
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write olcrtc config: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close olcrtc config: %w", err)
+	}
+	return path, nil
 }
 
 func randomHex(size int) (string, error) {
@@ -2416,13 +2630,21 @@ func runCmd(ctx context.Context, name string, args ...string) error {
 }
 
 func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*process, error) {
-	args := serverArgs(loc)
+	cfg, err := serverConfig(loc)
+	if err != nil {
+		return nil, fmt.Errorf("build olcrtc config for %s: %w", locationKey(loc), err)
+	}
+	configPath, err := writeTempOlcrtcConfig("olcrtc-manager-srv", cfg)
+	if err != nil {
+		return nil, err
+	}
 	ns, err := setupNetns(ctx, loc)
 	if err != nil {
+		_ = os.Remove(configPath)
 		return nil, fmt.Errorf("setup netns for %s: %w", locationKey(loc), err)
 	}
 
-	cmdArgs := append([]string{"netns", "exec", ns.Name, olcrtcPath}, args...)
+	cmdArgs := []string{"netns", "exec", ns.Name, olcrtcPath, configPath}
 	cmd := exec.CommandContext(ctx, "ip", cmdArgs...)
 	logs := newLogBuffer(500)
 	cmd.Stdout = logWriter{stream: "stdout", buffer: logs}
@@ -2430,16 +2652,18 @@ func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*proce
 
 	if err := cmd.Start(); err != nil {
 		cleanupNetns(context.Background(), ns)
+		_ = os.Remove(configPath)
 		return nil, fmt.Errorf("start olcrtc for %s: %w", locationKey(loc), err)
 	}
 
 	p := &process{location: loc, cmd: cmd, netns: ns, logs: logs, done: make(chan error, 1), started: time.Now(), running: true}
-	log.Printf("started olcrtc for %s in %s: %s %s", locationKey(loc), ns.Name, olcrtcPath, strings.Join(redactArgs(args), " "))
+	log.Printf("started olcrtc for %s in %s: %s %s", locationKey(loc), ns.Name, olcrtcPath, configPath)
 
 	go func() {
 		err := cmd.Wait()
 		p.markExited(err)
 		cleanupNetns(context.Background(), ns)
+		_ = os.Remove(configPath)
 		p.done <- err
 	}()
 
@@ -2582,11 +2806,17 @@ func isSupported(carrier, transport string) bool {
 		},
 		"jazz": {
 			"datachannel":  true,
+			"vp8channel":   false,
+			"seichannel":   false,
+			"videochannel": false,
+		},
+		"wbstream": {
+			"datachannel":  true,
 			"vp8channel":   true,
 			"seichannel":   true,
 			"videochannel": true,
 		},
-		"wbstream": {
+		"jitsi": {
 			"datachannel":  true,
 			"vp8channel":   true,
 			"seichannel":   true,
@@ -2612,6 +2842,9 @@ func validatePayload(t Transport) error {
 		if _, ok := keys[key]; !ok {
 			return fmt.Errorf("unsupported payload key %q for %s", key, t.Type)
 		}
+	}
+	if _, err := serverConfig(Location{Transport: t}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2647,36 +2880,6 @@ func min(a, b int) int {
 		return a
 	}
 	return b
-}
-
-func serverArgs(loc Location) []string {
-	args := []string{
-		"-mode", "srv",
-		"-carrier", loc.Carrier,
-		"-transport", loc.Transport.Type,
-		"-id", loc.Endpoint.RoomID,
-		"-client-id", loc.ClientID,
-		"-key", loc.Endpoint.Key,
-		"-link", loc.Link,
-		"-data", loc.Data,
-		"-dns", loc.DNS,
-	}
-
-	for _, key := range sortedKeys(loc.Transport.Payload) {
-		args = append(args, "-"+key, loc.Transport.Payload[key])
-	}
-	return args
-}
-
-func redactArgs(args []string) []string {
-	out := append([]string(nil), args...)
-	for i := 0; i < len(out)-1; i++ {
-		if out[i] == "-key" {
-			out[i+1] = "<redacted>"
-			i++
-		}
-	}
-	return out
 }
 
 func subscriptionHandler(supervisor *Supervisor) http.Handler {

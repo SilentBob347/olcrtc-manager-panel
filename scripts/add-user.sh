@@ -11,8 +11,8 @@ Options:
   --key KEY                Endpoint key for a generated default location.
   --name NAME              Location name for a generated default location.
   --room ROOM_ID           Room id for a generated default location.
-  --carrier CARRIER        Carrier for a generated default location (default: wbstream).
-  --transport TRANSPORT    Transport for a generated default location (default: datachannel).
+  --carrier CARRIER        Provider for a generated default location (default: wbstream).
+  --transport TRANSPORT    Transport for a generated default location (default: vp8channel).
   --dns DNS                DNS for a generated default location (default: 1.1.1.1:53).
   --reload URL             POST URL after saving, for example http://127.0.0.1:8888/-/reload.
   -h, --help               Show this help.
@@ -60,7 +60,7 @@ key=
 location_name="Default"
 room_id=
 carrier="wbstream"
-transport="datachannel"
+transport="vp8channel"
 dns="1.1.1.1:53"
 reload_url=
 
@@ -132,8 +132,10 @@ trap 'rm -f "$tmp"' EXIT HUP INT TERM
 python3 - "$config" "$tmp" "$client_id" "$from_client" "$key" "$location_name" "$room_id" "$carrier" "$transport" "$dns" "${OLCRTC_PATH:-}" <<'PY'
 import copy
 import json
+import os
 import subprocess
 import sys
+import tempfile
 
 config_path, tmp_path, client_id, from_client, key, location_name, room_id, carrier, transport, dns, olcrtc_path = sys.argv[1:]
 
@@ -144,10 +146,22 @@ def new_key():
     return subprocess.check_output(["openssl", "rand", "-hex", "32"], text=True).strip()
 
 def new_room_id(room_carrier, room_dns):
-    output = subprocess.check_output(
-        [olcrtc_path, "-mode", "gen", "-carrier", room_carrier, "-dns", room_dns, "-amount", "1"],
-        text=True,
-    )
+    fd, path = tempfile.mkstemp(prefix="olcrtc-manager-gen-", suffix=".yaml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({
+                "mode": "gen",
+                "auth": {"provider": room_carrier},
+                "net": {"dns": room_dns},
+                "gen": {"amount": 1},
+            }, f)
+            f.write("\n")
+        output = subprocess.check_output([olcrtc_path, path], text=True)
+    finally:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
     for line in output.splitlines():
         line = line.strip()
         if line:
