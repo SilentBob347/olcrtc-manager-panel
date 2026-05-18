@@ -4,7 +4,7 @@ set -euo pipefail
 PANEL_REPO="${PANEL_REPO:-https://github.com/BigDaddy3334/olcrtc-manager-panel.git}"
 PANEL_REF="${PANEL_REF:-main}"
 OLCRTC_REPO="${OLCRTC_REPO:-https://github.com/openlibrecommunity/olcrtc.git}"
-OLCRTC_REF="${OLCRTC_REF:-master}"
+OLCRTC_REF="${OLCRTC_REF:-refactor/universal-carrier}"
 GO_VERSION="${GO_VERSION:-1.25.0}"
 PANEL_ADDR="${PANEL_ADDR:-127.0.0.1}"
 PANEL_PORT="${PANEL_PORT:-8888}"

@@ -30,7 +30,7 @@ systemctl
 Runtime files expected by the default systemd unit:
 
 - `/usr/local/bin/olcrtc-manager`
-- `/usr/local/bin/olcrtc`
+- `/usr/local/bin/olcrtc` built from `openlibrecommunity/olcrtc` branch `refactor/universal-carrier`
 - `/etc/olcrtc-manager/config.json`
 - optional `/etc/olcrtc-manager/panel.env`
 
@@ -62,7 +62,7 @@ The installer:
 
 - installs required packages;
 - installs Go if the system Go is missing or too old;
-- builds and installs `olcrtc`;
+- builds and installs `olcrtc` from `refactor/universal-carrier`;
 - builds and installs `olcrtc-manager`;
 - creates `/etc/olcrtc-manager/config.json` without initial rooms if it does not exist;
 - keeps existing config and `panel.env`;
@@ -185,10 +185,10 @@ Minimal config:
         {
           "name": "Current VPS",
           "endpoint": {
-            "room_id": "room-01",
+            "room_id": "https://meet.example.org/room",
             "key": "e830d36f7be8cfb04a741fc1a5e2ddf8ff04f30985dc070616483f939ad5fafe"
           },
-          "carrier": "wbstream",
+          "carrier": "jitsi",
           "transport": {
             "type": "datachannel"
           },
@@ -212,7 +212,9 @@ Quota fields:
 
 The old top-level `locations` format is still accepted and normalized to `clients`.
 
-`endpoint.room_id` must be concrete. `any` is rejected.
+The manager config stays JSON for panel data, quotas, and subscriptions. For each running location the manager writes a temporary `olcrtc` YAML runtime config and starts `olcrtc <config.yaml>`.
+
+`carrier` maps to the new `olcrtc` `auth.provider` field. Supported providers are `jitsi`, `wbstream`, `telemost`, and `jazz`. For `jitsi`, `endpoint.room_id` is the full room URL, for example `https://meet.example.org/room`. For other providers it is the provider room ID. `any` is rejected.
 
 ## Network Isolation And Limits
 

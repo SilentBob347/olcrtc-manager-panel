@@ -29,6 +29,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed web/dist/*
@@ -45,6 +47,7 @@ type Config struct {
 	LegacyVersion    int        `json:"vesion"`
 	Name             string     `json:"name"`
 	Port             int        `json:"port"`
+	SubscriptionPath string     `json:"subscription_path"`
 	ActiveLocationID string     `json:"active_location_id"`
 	Clients          []Client   `json:"clients"`
 	Locations        []Location `json:"locations"`
@@ -94,6 +97,73 @@ type Endpoint struct {
 type Transport struct {
 	Type    string
 	Payload map[string]string
+}
+
+type olcrtcRuntimeConfig struct {
+	Mode   string             `yaml:"mode"`
+	Auth   olcrtcAuthConfig   `yaml:"auth"`
+	Room   olcrtcRoomConfig   `yaml:"room,omitempty"`
+	Crypto olcrtcCryptoConfig `yaml:"crypto,omitempty"`
+	Net    olcrtcNetConfig    `yaml:"net"`
+	SOCKS  olcrtcSocksConfig  `yaml:"socks,omitempty"`
+	VP8    *olcrtcVP8Config   `yaml:"vp8,omitempty"`
+	SEI    *olcrtcSEIConfig   `yaml:"sei,omitempty"`
+	Video  *olcrtcVideoConfig `yaml:"video,omitempty"`
+	Gen    *olcrtcGenConfig   `yaml:"gen,omitempty"`
+	Data   string             `yaml:"data,omitempty"`
+	Debug  bool               `yaml:"debug,omitempty"`
+	FFmpeg string             `yaml:"ffmpeg,omitempty"`
+}
+
+type olcrtcAuthConfig struct {
+	Provider string `yaml:"provider"`
+}
+
+type olcrtcRoomConfig struct {
+	ID string `yaml:"id,omitempty"`
+}
+
+type olcrtcCryptoConfig struct {
+	Key string `yaml:"key,omitempty"`
+}
+
+type olcrtcNetConfig struct {
+	Transport string `yaml:"transport,omitempty"`
+	DNS       string `yaml:"dns,omitempty"`
+}
+
+type olcrtcSocksConfig struct {
+	ProxyAddr string `yaml:"proxy_addr,omitempty"`
+	ProxyPort int    `yaml:"proxy_port,omitempty"`
+}
+
+type olcrtcVP8Config struct {
+	FPS       int `yaml:"fps,omitempty"`
+	BatchSize int `yaml:"batch_size,omitempty"`
+}
+
+type olcrtcSEIConfig struct {
+	FPS          int `yaml:"fps,omitempty"`
+	BatchSize    int `yaml:"batch_size,omitempty"`
+	FragmentSize int `yaml:"fragment_size,omitempty"`
+	AckTimeoutMS int `yaml:"ack_timeout_ms,omitempty"`
+}
+
+type olcrtcVideoConfig struct {
+	Width      int    `yaml:"width,omitempty"`
+	Height     int    `yaml:"height,omitempty"`
+	FPS        int    `yaml:"fps,omitempty"`
+	Bitrate    string `yaml:"bitrate,omitempty"`
+	HW         string `yaml:"hw,omitempty"`
+	QRSize     int    `yaml:"qr_size,omitempty"`
+	QRRecovery string `yaml:"qr_recovery,omitempty"`
+	Codec      string `yaml:"codec,omitempty"`
+	TileModule int    `yaml:"tile_module,omitempty"`
+	TileRS     int    `yaml:"tile_rs,omitempty"`
+}
+
+type olcrtcGenConfig struct {
+	Amount int `yaml:"amount"`
 }
 
 func (t *Transport) UnmarshalJSON(data []byte) error {
@@ -266,6 +336,7 @@ func run() error {
 	handler.Handle("/api/auth/logout", adminAuth(http.HandlerFunc(logoutHandler)))
 	handler.Handle("/api/auth/me", http.HandlerFunc(authMeHandler(configPath)))
 	handler.Handle("/api/auth/password", adminAuth(http.HandlerFunc(changePasswordHandler(configPath))))
+	handler.Handle("/api/settings", adminAuth(http.HandlerFunc(settingsHandler(configPath, supervisor, port != 0))))
 	handler.Handle("/api/reload", adminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -621,6 +692,14 @@ func (s *Supervisor) StopAll() {
 	s.processes = make(map[string]*process)
 }
 
+func (s *Supervisor) UpdateSettings(cfg Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cfg.Name = cfg.Name
+	s.cfg.Port = cfg.Port
+	s.cfg.SubscriptionPath = cfg.SubscriptionPath
+}
+
 func (s *Supervisor) Subscription(now time.Time) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -631,6 +710,12 @@ func (s *Supervisor) SubscriptionForClient(clientID string, now time.Time) (stri
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return subscriptionForClient(s.cfg, clientID, now)
+}
+
+func (s *Supervisor) SubscriptionPath() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg.SubscriptionPath
 }
 
 func (s *Supervisor) State() State {
@@ -670,11 +755,12 @@ func (s *Supervisor) State() State {
 	sort.Strings(clientIDs)
 
 	out := State{
-		Name:         s.cfg.Name,
-		Port:         s.cfg.Port,
-		ClientCount:  len(clientIDs),
-		RunningCount: s.runningCountLocked(),
-		Clients:      make([]ClientState, 0, len(clientIDs)),
+		Name:             s.cfg.Name,
+		Port:             s.cfg.Port,
+		SubscriptionPath: s.cfg.SubscriptionPath,
+		ClientCount:      len(clientIDs),
+		RunningCount:     s.runningCountLocked(),
+		Clients:          make([]ClientState, 0, len(clientIDs)),
 	}
 	for _, id := range clientIDs {
 		quota := Quota{}
@@ -858,11 +944,12 @@ func (s *Supervisor) runningCountLocked() int {
 }
 
 type State struct {
-	Name         string        `json:"name"`
-	Port         int           `json:"port"`
-	ClientCount  int           `json:"client_count"`
-	RunningCount int           `json:"running_count"`
-	Clients      []ClientState `json:"clients"`
+	Name             string        `json:"name"`
+	Port             int           `json:"port"`
+	SubscriptionPath string        `json:"subscription_path"`
+	ClientCount      int           `json:"client_count"`
+	RunningCount     int           `json:"running_count"`
+	Clients          []ClientState `json:"clients"`
 }
 
 type ClientState struct {
@@ -952,6 +1039,114 @@ type clientActionRequest struct {
 type generateRoomRequest struct {
 	Carrier string `json:"carrier"`
 	DNS     string `json:"dns"`
+}
+
+type settingsResponse struct {
+	Name                string `json:"name"`
+	Port                int    `json:"port"`
+	SubscriptionPath    string `json:"subscription_path"`
+	AdminUser           string `json:"admin_user"`
+	PortOverride        bool   `json:"port_override"`
+	RestartRequired     bool   `json:"restart_required,omitempty"`
+	SubscriptionBaseURL string `json:"subscription_base_url"`
+}
+
+type updateSettingsRequest struct {
+	Name             string `json:"name"`
+	Port             int    `json:"port"`
+	SubscriptionPath string `json:"subscription_path"`
+}
+
+func settingsHandler(configPath string, supervisor *Supervisor, portOverride bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cfg, err := loadConfig(configPath)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, settingsFromConfig(r, configPath, cfg, portOverride, false))
+		case http.MethodPut:
+			var req updateSettingsRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			cfg, restartRequired, err := updateSettings(configPath, req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			supervisor.UpdateSettings(cfg)
+			writeJSON(w, settingsFromConfig(r, configPath, cfg, portOverride, restartRequired))
+		default:
+			w.Header().Set("Allow", "GET, PUT")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func updateSettings(configPath string, req updateSettingsRequest) (Config, bool, error) {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return Config{}, false, err
+	}
+	oldPort := cfg.Port
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		return Config{}, false, errors.New("name is required")
+	}
+	cfg.Name = req.Name
+	cfg.Port = req.Port
+	path, err := normalizeSubscriptionPath(req.SubscriptionPath)
+	if err != nil {
+		return Config{}, false, err
+	}
+	cfg.SubscriptionPath = path
+	cfg.Normalize()
+	if err := cfg.Validate(); err != nil {
+		return Config{}, false, err
+	}
+	if err := saveConfig(configPath, cfg); err != nil {
+		return Config{}, false, err
+	}
+	return cfg, cfg.Port != oldPort, nil
+}
+
+func settingsFromConfig(r *http.Request, configPath string, cfg Config, portOverride bool, restartRequired bool) settingsResponse {
+	return settingsResponse{
+		Name:                cfg.Name,
+		Port:                cfg.Port,
+		SubscriptionPath:    cfg.SubscriptionPath,
+		AdminUser:           currentAdminUser(configPath),
+		PortOverride:        portOverride,
+		RestartRequired:     restartRequired,
+		SubscriptionBaseURL: subscriptionBaseURL(r, cfg.SubscriptionPath),
+	}
+}
+
+func subscriptionBaseURL(r *http.Request, subscriptionPath string) string {
+	base := requestOrigin(r)
+	if subscriptionPath == "" {
+		return base + "/"
+	}
+	return base + "/" + subscriptionPath + "/"
+}
+
+func requestOrigin(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		scheme = strings.Split(forwarded, ",")[0]
+	}
+	host := r.Host
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); forwarded != "" {
+		host = strings.Split(forwarded, ",")[0]
+	}
+	return scheme + "://" + strings.TrimSpace(host)
 }
 
 func addClientFromRequest(ctx context.Context, configPath, olcrtcPath string, r *http.Request) (string, error) {
@@ -1389,9 +1584,22 @@ func templateLocations(cfg Config, fromClient string) ([]Location, error) {
 func generateRoomID(ctx context.Context, olcrtcPath, carrier, dns string) (string, error) {
 	genCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(genCtx, olcrtcPath, "-mode", "gen", "-carrier", carrier, "-dns", dns, "-amount", "1").Output()
+
+	cfg := olcrtcRuntimeConfig{
+		Mode: "gen",
+		Auth: olcrtcAuthConfig{Provider: carrier},
+		Net:  olcrtcNetConfig{DNS: dns},
+		Gen:  &olcrtcGenConfig{Amount: 1},
+	}
+	configPath, err := writeTempOlcrtcConfig("olcrtc-manager-gen", cfg)
 	if err != nil {
-		return "", fmt.Errorf("generate room id: %w", err)
+		return "", err
+	}
+	defer func() { _ = os.Remove(configPath) }()
+
+	out, err := exec.CommandContext(genCtx, olcrtcPath, configPath).CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("generate room id: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
@@ -1400,6 +1608,138 @@ func generateRoomID(ctx context.Context, olcrtcPath, carrier, dns string) (strin
 		}
 	}
 	return "", errors.New("olcrtc generated empty room id")
+}
+
+func serverConfig(loc Location) (olcrtcRuntimeConfig, error) {
+	cfg := olcrtcRuntimeConfig{
+		Mode:   "srv",
+		Auth:   olcrtcAuthConfig{Provider: loc.Carrier},
+		Room:   olcrtcRoomConfig{ID: loc.Endpoint.RoomID},
+		Crypto: olcrtcCryptoConfig{Key: loc.Endpoint.Key},
+		Net: olcrtcNetConfig{
+			Transport: loc.Transport.Type,
+			DNS:       loc.DNS,
+		},
+		Data: loc.Data,
+	}
+	if err := applyTransportPayload(&cfg, loc.Transport); err != nil {
+		return olcrtcRuntimeConfig{}, err
+	}
+	return cfg, nil
+}
+
+func applyTransportPayload(cfg *olcrtcRuntimeConfig, transport Transport) error {
+	payload := cleanPayload(transport.Payload)
+	switch transport.Type {
+	case "datachannel":
+		return nil
+	case "vp8channel":
+		vp8 := olcrtcVP8Config{}
+		if err := setPayloadInt(payload, "vp8-fps", &vp8.FPS); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "vp8-batch", &vp8.BatchSize); err != nil {
+			return err
+		}
+		if vp8 != (olcrtcVP8Config{}) {
+			cfg.VP8 = &vp8
+		}
+	case "seichannel":
+		sei := olcrtcSEIConfig{}
+		if err := setPayloadInt(payload, "fps", &sei.FPS); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "batch", &sei.BatchSize); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "frag", &sei.FragmentSize); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "ack-ms", &sei.AckTimeoutMS); err != nil {
+			return err
+		}
+		if sei != (olcrtcSEIConfig{}) {
+			cfg.SEI = &sei
+		}
+	case "videochannel":
+		video := olcrtcVideoConfig{}
+		if err := setPayloadInt(payload, "video-w", &video.Width); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "video-h", &video.Height); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "video-fps", &video.FPS); err != nil {
+			return err
+		}
+		if err := setPayloadNonNegativeInt(payload, "video-qr-size", &video.QRSize); err != nil {
+			return err
+		}
+		if err := setPayloadInt(payload, "video-tile-module", &video.TileModule); err != nil {
+			return err
+		}
+		if err := setPayloadNonNegativeInt(payload, "video-tile-rs", &video.TileRS); err != nil {
+			return err
+		}
+		video.Bitrate = payload["video-bitrate"]
+		video.HW = payload["video-hw"]
+		video.Codec = payload["video-codec"]
+		video.QRRecovery = payload["video-qr-recovery"]
+		if video != (olcrtcVideoConfig{}) {
+			cfg.Video = &video
+		}
+	default:
+		return fmt.Errorf("unknown transport %q", transport.Type)
+	}
+	return nil
+}
+
+func setPayloadInt(payload map[string]string, key string, dst *int) error {
+	value := strings.TrimSpace(payload[key])
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fmt.Errorf("%s must be a positive integer", key)
+	}
+	*dst = parsed
+	return nil
+}
+
+func setPayloadNonNegativeInt(payload map[string]string, key string, dst *int) error {
+	value := strings.TrimSpace(payload[key])
+	if value == "" {
+		return nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		return fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	*dst = parsed
+	return nil
+}
+
+func writeTempOlcrtcConfig(prefix string, cfg olcrtcRuntimeConfig) (string, error) {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshal olcrtc config: %w", err)
+	}
+	file, err := os.CreateTemp("", prefix+"-*.yaml")
+	if err != nil {
+		return "", fmt.Errorf("create olcrtc config: %w", err)
+	}
+	path := file.Name()
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write olcrtc config: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close olcrtc config: %w", err)
+	}
+	return path, nil
 }
 
 func randomHex(size int) (string, error) {
@@ -2416,13 +2756,21 @@ func runCmd(ctx context.Context, name string, args ...string) error {
 }
 
 func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*process, error) {
-	args := serverArgs(loc)
+	cfg, err := serverConfig(loc)
+	if err != nil {
+		return nil, fmt.Errorf("build olcrtc config for %s: %w", locationKey(loc), err)
+	}
+	configPath, err := writeTempOlcrtcConfig("olcrtc-manager-srv", cfg)
+	if err != nil {
+		return nil, err
+	}
 	ns, err := setupNetns(ctx, loc)
 	if err != nil {
+		_ = os.Remove(configPath)
 		return nil, fmt.Errorf("setup netns for %s: %w", locationKey(loc), err)
 	}
 
-	cmdArgs := append([]string{"netns", "exec", ns.Name, olcrtcPath}, args...)
+	cmdArgs := []string{"netns", "exec", ns.Name, olcrtcPath, configPath}
 	cmd := exec.CommandContext(ctx, "ip", cmdArgs...)
 	logs := newLogBuffer(500)
 	cmd.Stdout = logWriter{stream: "stdout", buffer: logs}
@@ -2430,16 +2778,18 @@ func startInstance(ctx context.Context, olcrtcPath string, loc Location) (*proce
 
 	if err := cmd.Start(); err != nil {
 		cleanupNetns(context.Background(), ns)
+		_ = os.Remove(configPath)
 		return nil, fmt.Errorf("start olcrtc for %s: %w", locationKey(loc), err)
 	}
 
 	p := &process{location: loc, cmd: cmd, netns: ns, logs: logs, done: make(chan error, 1), started: time.Now(), running: true}
-	log.Printf("started olcrtc for %s in %s: %s %s", locationKey(loc), ns.Name, olcrtcPath, strings.Join(redactArgs(args), " "))
+	log.Printf("started olcrtc for %s in %s: %s %s", locationKey(loc), ns.Name, olcrtcPath, configPath)
 
 	go func() {
 		err := cmd.Wait()
 		p.markExited(err)
 		cleanupNetns(context.Background(), ns)
+		_ = os.Remove(configPath)
 		p.done <- err
 	}()
 
@@ -2500,6 +2850,10 @@ func (c *Config) Normalize() {
 		c.Version = c.LegacyVersion
 	}
 
+	if path, err := normalizeSubscriptionPath(c.SubscriptionPath); err == nil {
+		c.SubscriptionPath = path
+	}
+
 	if len(c.Clients) == 0 {
 		return
 	}
@@ -2519,6 +2873,9 @@ func (c *Config) Normalize() {
 func (c Config) Validate() error {
 	if c.Port <= 0 || c.Port > 65535 {
 		return fmt.Errorf("port must be between 1 and 65535, got %d", c.Port)
+	}
+	if _, err := normalizeSubscriptionPath(c.SubscriptionPath); err != nil {
+		return fmt.Errorf("subscription_path: %w", err)
 	}
 	for i, client := range c.Clients {
 		if err := validateQuota(client.Quota); err != nil {
@@ -2582,11 +2939,17 @@ func isSupported(carrier, transport string) bool {
 		},
 		"jazz": {
 			"datachannel":  true,
+			"vp8channel":   false,
+			"seichannel":   false,
+			"videochannel": false,
+		},
+		"wbstream": {
+			"datachannel":  true,
 			"vp8channel":   true,
 			"seichannel":   true,
 			"videochannel": true,
 		},
-		"wbstream": {
+		"jitsi": {
 			"datachannel":  true,
 			"vp8channel":   true,
 			"seichannel":   true,
@@ -2612,6 +2975,9 @@ func validatePayload(t Transport) error {
 		if _, ok := keys[key]; !ok {
 			return fmt.Errorf("unsupported payload key %q for %s", key, t.Type)
 		}
+	}
+	if _, err := serverConfig(Location{Transport: t}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -2642,6 +3008,38 @@ func defaultString(value, fallback string) string {
 	return fallback
 }
 
+func normalizeSubscriptionPath(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return "", nil
+	}
+	if strings.Contains(path, "\\") || strings.Contains(path, "?") || strings.Contains(path, "#") {
+		return "", errors.New("must be a plain URL path without query or fragment")
+	}
+	parts := strings.Split(path, "/")
+	reserved := map[string]struct{}{
+		"-":      {},
+		"admin":  {},
+		"api":    {},
+		"assets": {},
+	}
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", errors.New("must not contain empty, . or .. segments")
+		}
+		if strings.ContainsAny(part, " \t\r\n") {
+			return "", errors.New("must not contain whitespace")
+		}
+		if i == 0 {
+			if _, ok := reserved[part]; ok {
+				return "", fmt.Errorf("must not start with reserved segment %q", part)
+			}
+		}
+	}
+	return strings.Join(parts, "/"), nil
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -2649,39 +3047,9 @@ func min(a, b int) int {
 	return b
 }
 
-func serverArgs(loc Location) []string {
-	args := []string{
-		"-mode", "srv",
-		"-carrier", loc.Carrier,
-		"-transport", loc.Transport.Type,
-		"-id", loc.Endpoint.RoomID,
-		"-client-id", loc.ClientID,
-		"-key", loc.Endpoint.Key,
-		"-link", loc.Link,
-		"-data", loc.Data,
-		"-dns", loc.DNS,
-	}
-
-	for _, key := range sortedKeys(loc.Transport.Payload) {
-		args = append(args, "-"+key, loc.Transport.Payload[key])
-	}
-	return args
-}
-
-func redactArgs(args []string) []string {
-	out := append([]string(nil), args...)
-	for i := 0; i < len(out)-1; i++ {
-		if out[i] == "-key" {
-			out[i+1] = "<redacted>"
-			i++
-		}
-	}
-	return out
-}
-
 func subscriptionHandler(supervisor *Supervisor) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientID, ok := clientIDFromPath(r.URL.Path)
+		clientID, ok := clientIDFromSubscriptionPath(r.URL.Path, supervisor.SubscriptionPath())
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -3106,6 +3474,21 @@ func clientIDFromPath(path string) (string, bool) {
 		return "", false
 	}
 	return clientID, true
+}
+
+func clientIDFromSubscriptionPath(path, subscriptionPath string) (string, bool) {
+	subscriptionPath, err := normalizeSubscriptionPath(subscriptionPath)
+	if err != nil {
+		return "", false
+	}
+	if subscriptionPath == "" {
+		return clientIDFromPath(path)
+	}
+	prefix := "/" + subscriptionPath + "/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+	return clientIDFromPath(strings.TrimPrefix(path, "/"+subscriptionPath))
 }
 
 func subscription(cfg Config, now time.Time) string {

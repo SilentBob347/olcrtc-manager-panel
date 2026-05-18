@@ -51,11 +51,11 @@ func TestSubscriptionUsesDocumentedPayloadKeys(t *testing.T) {
 	}
 }
 
-func TestServerArgsMapPayloadToCLIFlags(t *testing.T) {
+func TestServerConfigMapsPayloadToYAMLSections(t *testing.T) {
 	loc := Location{
 		ClientID: "user",
 		Endpoint: Endpoint{RoomID: "room-01", Key: "key"},
-		Carrier:  "jazz",
+		Carrier:  "wbstream",
 		Transport: Transport{
 			Type: "seichannel",
 			Payload: map[string]string{
@@ -70,21 +70,49 @@ func TestServerArgsMapPayloadToCLIFlags(t *testing.T) {
 		DNS:  "1.1.1.1:53",
 	}
 
-	got := strings.Join(serverArgs(loc), " ")
-	for _, part := range []string{
-		"-mode srv",
-		"-carrier jazz",
-		"-transport seichannel",
-		"-id room-01",
-		"-client-id user",
-		"-ack-ms 2000",
-		"-batch 64",
-		"-fps 60",
-		"-frag 900",
-	} {
-		if !strings.Contains(got, part) {
-			t.Fatalf("server args missing %q in %q", part, got)
-		}
+	got, err := serverConfig(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != "srv" || got.Auth.Provider != "wbstream" || got.Room.ID != "room-01" || got.Crypto.Key != "key" {
+		t.Fatalf("server config core fields = %#v", got)
+	}
+	if got.Net.Transport != "seichannel" || got.Net.DNS != "1.1.1.1:53" || got.Data != "data" {
+		t.Fatalf("server config net/data fields = %#v", got)
+	}
+	if got.SEI == nil {
+		t.Fatal("server config missing sei section")
+	}
+	if got.SEI.FPS != 60 || got.SEI.BatchSize != 64 || got.SEI.FragmentSize != 900 || got.SEI.AckTimeoutMS != 2000 {
+		t.Fatalf("sei config = %#v", got.SEI)
+	}
+}
+
+func TestServerConfigAllowsVideoAutoQRSize(t *testing.T) {
+	loc := testLocation("room-01", "Video")
+	loc.Transport = Transport{
+		Type: "videochannel",
+		Payload: map[string]string{
+			"video-w":       "1080",
+			"video-h":       "1080",
+			"video-fps":     "60",
+			"video-bitrate": "5000k",
+			"video-hw":      "none",
+			"video-codec":   "qrcode",
+			"video-qr-size": "0",
+			"video-tile-rs": "0",
+		},
+	}
+
+	got, err := serverConfig(loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Video == nil {
+		t.Fatal("server config missing video section")
+	}
+	if got.Video.QRSize != 0 || got.Video.TileRS != 0 {
+		t.Fatalf("video zero-valued options = %#v", got.Video)
 	}
 }
 
@@ -172,6 +200,35 @@ func TestSubscriptionHandlerServesClientPath(t *testing.T) {
 	}
 }
 
+func TestSubscriptionHandlerServesConfiguredBasePath(t *testing.T) {
+	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
+		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
+	})
+	loc := testLocation("room-01", "Netherlands")
+	cfg := testConfig(loc)
+	cfg.SubscriptionPath = "sub"
+	if err := supervisor.StartAll(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/sub/user/", nil)
+	rec := httptest.NewRecorder()
+	subscriptionHandler(supervisor).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "%user$Netherlands") {
+		t.Fatalf("response missing user subscription:\n%s", got)
+	}
+
+	rec = httptest.NewRecorder()
+	subscriptionHandler(supervisor).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/user/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("root status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
 func TestSubscriptionHandlerRejectsRootAndUnknownClient(t *testing.T) {
 	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
 		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
@@ -187,6 +244,36 @@ func TestSubscriptionHandlerRejectsRootAndUnknownClient(t *testing.T) {
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want %d", path, rec.Code, http.StatusNotFound)
 		}
+	}
+}
+
+func TestUpdateSettingsNormalizesSubscriptionPath(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	if err := writeConfig(configPath, Config{
+		Name: "Old",
+		Port: 8888,
+		Clients: []Client{{
+			ClientID:  "user",
+			Locations: []Location{testLocation("room-01", "Netherlands")},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, restartRequired, err := updateSettings(configPath, updateSettingsRequest{
+		Name:             "New",
+		Port:             9443,
+		SubscriptionPath: "/subscription/",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restartRequired {
+		t.Fatal("restartRequired = false, want true")
+	}
+	if cfg.Name != "New" || cfg.Port != 9443 || cfg.SubscriptionPath != "subscription" {
+		t.Fatalf("settings = %#v", cfg)
 	}
 }
 
