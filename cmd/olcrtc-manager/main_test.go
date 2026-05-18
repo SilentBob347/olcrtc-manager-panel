@@ -39,7 +39,7 @@ func TestSubscriptionUsesDocumentedPayloadKeys(t *testing.T) {
 
 	got := subscription(cfg, time.Unix(1778011200, 0))
 
-	want := "olcrtc://wbstream?vp8channel<vp8-batch=64&vp8-fps=60>@room-01#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa%user$Netherlands"
+	want := "olcrtc://wbstream?vp8channel<vp8-batch=64&vp8-fps=60>@room-01#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$Netherlands"
 	if !strings.Contains(got, want) {
 		t.Fatalf("subscription missing URI\nwant: %s\ngot:\n%s", want, got)
 	}
@@ -195,7 +195,7 @@ func TestSubscriptionHandlerServesClientPath(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	if got := rec.Body.String(); !strings.Contains(got, "%user$Netherlands") {
+	if got := rec.Body.String(); !strings.Contains(got, "#key$Netherlands") {
 		t.Fatalf("response missing user subscription:\n%s", got)
 	}
 }
@@ -218,7 +218,7 @@ func TestSubscriptionHandlerServesConfiguredBasePath(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
-	if got := rec.Body.String(); !strings.Contains(got, "%user$Netherlands") {
+	if got := rec.Body.String(); !strings.Contains(got, "#key$Netherlands") {
 		t.Fatalf("response missing user subscription:\n%s", got)
 	}
 

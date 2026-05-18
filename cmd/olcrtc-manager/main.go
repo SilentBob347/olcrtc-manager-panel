@@ -3552,13 +3552,12 @@ func subscriptionForLocations(name string, locations []Location, quota Quota, no
 
 func locationURI(loc Location) string {
 	payload := payloadString(loc.Transport.Payload)
-	return fmt.Sprintf("olcrtc://%s?%s%s@%s#%s%%%s$%s",
+	return fmt.Sprintf("olcrtc://%s?%s%s@%s#%s$%s",
 		loc.Carrier,
 		loc.Transport.Type,
 		payload,
 		loc.Endpoint.RoomID,
 		loc.Endpoint.Key,
-		loc.ClientID,
 		loc.Name,
 	)
 }
