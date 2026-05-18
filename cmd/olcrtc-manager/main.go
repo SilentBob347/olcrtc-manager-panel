@@ -379,12 +379,12 @@ func run() error {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/logs/"), "/")
-		if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		clientID, roomID, transport := logRequestTarget(r)
+		if clientID == "" || roomID == "" || transport == "" {
 			http.NotFound(w, r)
 			return
 		}
-		lines, ok := supervisor.Logs(parts[0], parts[1], parts[2])
+		lines, ok := supervisor.Logs(clientID, roomID, transport)
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -1134,6 +1134,20 @@ func subscriptionBaseURL(r *http.Request, subscriptionPath string) string {
 	return base + "/" + subscriptionPath + "/"
 }
 
+func logRequestTarget(r *http.Request) (string, string, string) {
+	query := r.URL.Query()
+	if query.Has("client_id") || query.Has("room_id") || query.Has("transport") {
+		return strings.TrimSpace(query.Get("client_id")),
+			strings.TrimSpace(query.Get("room_id")),
+			strings.TrimSpace(query.Get("transport"))
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/logs/"), "/")
+	if len(parts) != 3 {
+		return "", "", ""
+	}
+	return parts[0], parts[1], parts[2]
+}
+
 func requestOrigin(r *http.Request) string {
 	scheme := "http"
 	if r.TLS != nil {
@@ -1395,10 +1409,10 @@ func deleteClient(configPath, clientID string) error {
 	if !deleted {
 		return fmt.Errorf("client %q not found", clientID)
 	}
-	if len(next) == 0 {
-		return errors.New("cannot delete the last client")
-	}
 	cfg.Clients = next
+	if len(cfg.Clients) == 0 {
+		cfg.Locations = nil
+	}
 	cfg.Normalize()
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -1463,9 +1477,6 @@ func deleteLocation(configPath, clientID, roomID string) error {
 		}
 		if !deleted {
 			return fmt.Errorf("location %q not found", roomID)
-		}
-		if len(next) == 0 {
-			return errors.New("cannot delete the last location")
 		}
 		cfg.Clients[i].Locations = next
 		cfg.Normalize()
@@ -3012,7 +3023,7 @@ func normalizeSubscriptionPath(path string) (string, error) {
 	path = strings.TrimSpace(path)
 	path = strings.Trim(path, "/")
 	if path == "" {
-		return "", nil
+		return "sub", nil
 	}
 	if strings.Contains(path, "\\") || strings.Contains(path, "?") || strings.Contains(path, "#") {
 		return "", errors.New("must be a plain URL path without query or fragment")

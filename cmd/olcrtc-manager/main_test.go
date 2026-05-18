@@ -179,7 +179,7 @@ func TestSubscriptionForClientRejectsUnknownClient(t *testing.T) {
 	}
 }
 
-func TestSubscriptionHandlerServesClientPath(t *testing.T) {
+func TestSubscriptionHandlerServesDefaultSubPath(t *testing.T) {
 	supervisor := NewSupervisor("olcrtc", func(ctx context.Context, path string, loc Location) (*process, error) {
 		return &process{location: loc, logs: newLogBuffer(1), running: true}, nil
 	})
@@ -188,7 +188,7 @@ func TestSubscriptionHandlerServesClientPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/user/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/sub/user/", nil)
 	rec := httptest.NewRecorder()
 	subscriptionHandler(supervisor).ServeHTTP(rec, req)
 
@@ -237,7 +237,7 @@ func TestSubscriptionHandlerRejectsRootAndUnknownClient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, path := range []string{"/", "/missing", "/user/extra"} {
+	for _, path := range []string{"/", "/missing", "/user/", "/sub/user/extra"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		subscriptionHandler(supervisor).ServeHTTP(rec, req)
@@ -274,6 +274,48 @@ func TestUpdateSettingsNormalizesSubscriptionPath(t *testing.T) {
 	}
 	if cfg.Name != "New" || cfg.Port != 9443 || cfg.SubscriptionPath != "subscription" {
 		t.Fatalf("settings = %#v", cfg)
+	}
+}
+
+func TestConfigDefaultsSubscriptionPathToSub(t *testing.T) {
+	cfg := Config{Name: "ScumVPN", Port: 8888}
+	cfg.Normalize()
+	if cfg.SubscriptionPath != "sub" {
+		t.Fatalf("SubscriptionPath = %q, want sub", cfg.SubscriptionPath)
+	}
+}
+
+func TestLogRequestTargetAllowsSlashesInRoomID(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/api/logs/?client_id=user&room_id=https%3A%2F%2Fmeet.example.org%2Froom&transport=datachannel", nil)
+	clientID, roomID, transport := logRequestTarget(req)
+	if clientID != "user" || roomID != "https://meet.example.org/room" || transport != "datachannel" {
+		t.Fatalf("log target = %q, %q, %q", clientID, roomID, transport)
+	}
+}
+
+func TestDeleteLastClient(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	if err := writeConfig(configPath, Config{
+		Name: "ScumVPN",
+		Port: 8888,
+		Clients: []Client{{
+			ClientID:  "user",
+			Locations: []Location{testLocation("room-01", "Netherlands")},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := deleteClient(configPath, "user"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Clients) != 0 || len(cfg.Locations) != 0 {
+		t.Fatalf("config after delete = %#v", cfg)
 	}
 }
 
@@ -550,6 +592,35 @@ func TestUpdateClientReplacesLocations(t *testing.T) {
 	}
 	if got := cfg.Clients[0].Locations[0].Name; got != "Only WB" {
 		t.Fatalf("location name = %q, want Only WB", got)
+	}
+}
+
+func TestDeleteLastLocation(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.json")
+	if err := writeConfig(configPath, Config{
+		Name: "ScumVPN",
+		Port: 8888,
+		Clients: []Client{{
+			ClientID:  "user",
+			Locations: []Location{testLocation("room-01", "WB")},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := deleteLocation(configPath, "user", "room-01"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Clients) != 1 {
+		t.Fatalf("clients = %d, want 1", len(cfg.Clients))
+	}
+	if len(cfg.Clients[0].Locations) != 0 || len(cfg.Locations) != 0 {
+		t.Fatalf("config after deleting last location = %#v", cfg)
 	}
 }
 
