@@ -285,6 +285,14 @@ func TestConfigDefaultsSubscriptionPathToSub(t *testing.T) {
 	}
 }
 
+func TestParseProcStatusMemoryBytes(t *testing.T) {
+	data := []byte("Name:\tolcrtc\nVmPeak:\t  204800 kB\nVmRSS:\t   12345 kB\n")
+
+	if got := parseProcStatusMemoryBytes(data); got != 12345*1024 {
+		t.Fatalf("memory bytes = %d, want %d", got, 12345*1024)
+	}
+}
+
 func TestLogRequestTargetAllowsSlashesInRoomID(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/api/logs/?client_id=user&room_id=https%3A%2F%2Fmeet.example.org%2Froom&transport=datachannel", nil)
 	clientID, roomID, transport := logRequestTarget(req)

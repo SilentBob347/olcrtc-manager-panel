@@ -38,6 +38,7 @@ type RuntimeState = {
   status: string;
   running: boolean;
   pid?: number;
+  memory_bytes?: number;
   started_at?: string;
   exited_at?: string;
   exit_error?: string;
@@ -1269,6 +1270,11 @@ function App() {
     return <LoginView setupRequired={setupRequired} onLogin={afterLogin} />;
   }
 
+  const serversMemoryBytes = metrics?.children.reduce(
+    (total, child) => total + (child.runtime.memory_bytes ?? 0),
+    0,
+  );
+
   return (
     <div className="min-h-screen">
       <header className="border-b border-border bg-background/95">
@@ -1278,6 +1284,7 @@ function App() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <HeaderMetric label="Panel mem" value={formatBytes(metrics?.memory.heap_alloc_bytes)} />
+            <HeaderMetric label="Servers mem" value={formatBytes(serversMemoryBytes)} />
             <HeaderMetric label="Panel PID" value={metrics?.manager.pid ?? "..."} />
             <button
               className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80"

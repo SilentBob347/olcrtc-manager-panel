@@ -973,14 +973,15 @@ type LocationState struct {
 }
 
 type RuntimeState struct {
-	Status    string `json:"status"`
-	Running   bool   `json:"running"`
-	PID       int    `json:"pid,omitempty"`
-	StartedAt string `json:"started_at,omitempty"`
-	ExitedAt  string `json:"exited_at,omitempty"`
-	ExitError string `json:"exit_error,omitempty"`
-	LogCount  int    `json:"log_count"`
-	Restarts  int    `json:"restarts"`
+	Status      string `json:"status"`
+	Running     bool   `json:"running"`
+	PID         int    `json:"pid,omitempty"`
+	MemoryBytes uint64 `json:"memory_bytes,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	ExitedAt    string `json:"exited_at,omitempty"`
+	ExitError   string `json:"exit_error,omitempty"`
+	LogCount    int    `json:"log_count"`
+	Restarts    int    `json:"restarts"`
 }
 
 type LogLine struct {
@@ -1952,8 +1953,37 @@ func (p *process) state() RuntimeState {
 	}
 	if p.cmd != nil && p.cmd.Process != nil && p.running {
 		state.PID = p.cmd.Process.Pid
+		state.MemoryBytes = processMemoryBytes(state.PID)
 	}
 	return state
+}
+
+func processMemoryBytes(pid int) uint64 {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return 0
+	}
+	return parseProcStatusMemoryBytes(data)
+}
+
+func parseProcStatusMemoryBytes(data []byte) uint64 {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0
+		}
+		return kb * 1024
+	}
+	return 0
 }
 
 func (p *process) markExited(err error) {
